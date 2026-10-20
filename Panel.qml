@@ -1532,6 +1532,18 @@ Panel {
                 font.pixelSize: Style.font.caption
                 wrapMode: Text.WordWrap
               }
+
+              // Adding this beside a FIDO2 wrap lowers the key to the seal.
+              Text {
+                textFormat: Text.PlainText
+                visible: root.vault.fpDowngradeWarning !== ""
+                width: parent.width
+                text: "󰀪  " + root.vault.fpDowngradeWarning
+                color: root.urgent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
             }
 
             Column {
@@ -1987,6 +1999,18 @@ Panel {
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.WordWrap
+            }
+
+            // Adding this beside a FIDO2 wrap lowers the key to an offline search.
+            Text {
+              textFormat: Text.PlainText
+              visible: root.vault.pinDowngradeWarning !== ""
+              width: parent.width
+              text: "󰀪  " + root.vault.pinDowngradeWarning
+              color: root.urgent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
               wrapMode: Text.WordWrap
             }
           }

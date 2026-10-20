@@ -8,6 +8,13 @@ import "BitwardenModel.js" as Model
 // Omarchy's existing pam-u2f credential, which opens the envelope's FIDO wrap
 // (BitwardenModel.js), so unlocking needs the physical key. The vault only
 // passes in the setting and takes back the password.
+//
+// The key is asked only when the user asks (startUnlock() from the unlock
+// button), never because a screen appeared: a request left waiting on the
+// key is answered by whatever touch comes next, including one meant for
+// another prompt. A registration that asks for the key's PIN gets it from
+// pinentry, under the vault helper, held by name and handed to the pipeline
+// on its stdin; the shell never sees it.
 Item {
   id: fido
 
@@ -123,35 +130,72 @@ Item {
       return
     }
     legacyStored = String(raw || "").trim() === "yes"
-    // An SSH request can raise the auth surface before the panel opens.
-    if (ready && vault && vault.status === "locked" && vault.sshAuthSurfaceActive) startUnlock()
+    // Readiness is all this changes: the key waits for the button.
   }
 
   // A credential with an envelope wrap on a plugged-in key; failing that,
   // while the legacy entry exists, any usable one (its touch migrates it).
+  // `needsPin` follows the registration's options (+pin, +verification).
   function unlockTarget() {
     var usable = probe.usable || []
     for (var i = 0; i < usable.length; i++) {
       for (var j = 0; j < envelopeCredentials.length; j++) {
         var wrap = envelopeCredentials[j]
         if (wrap.cred === usable[i].cred) {
-          return { mode: "envelope", device: usable[i].device, cred: wrap.cred, rp: wrap.rp, salt: wrap.salt }
+          return { mode: "envelope", device: usable[i].device, cred: wrap.cred, rp: wrap.rp, salt: wrap.salt,
+            needsPin: usable[i].needsPin === true }
         }
       }
     }
     if (legacyStored && usable.length > 0 && probe.rp) {
-      return { mode: "legacy", device: usable[0].device, cred: usable[0].cred, rp: probe.rp }
+      return { mode: "legacy", device: usable[0].device, cred: usable[0].cred, rp: probe.rp,
+        needsPin: usable[0].needsPin === true }
     }
     return null
   }
 
   function unavailableReason() {
-    if (probe.pinOnly) {
-      return "Your key's registration asks for its PIN as well as a touch, which vault unlock "
-        + "cannot collect yet. Use your master password."
-    }
     if (!probe.usable || probe.usable.length === 0) return "No registered FIDO2 key is plugged in."
     return "This key is not set up for vault unlock. Set up FIDO2 unlock again."
+  }
+
+  // The key's PIN is typed into pinentry only: the panel's own field would
+  // put it in the shell, and this unlock exists to keep secrets out of there.
+  readonly property string pinUnavailableReason: "Your key's registration asks for its PIN, which is typed into "
+    + "pinentry; pinentry is off, missing or waiting for the vault helper. Use your master password."
+
+  // The held key PIN (Model.heldSecretRef()) across one attempt and its
+  // busy retries; forgotten with the outcome.
+  property string pinRef: ""
+
+  function forgetPin() {
+    if (pinRef && vault) vault.forgetHeldPassword(pinRef)
+    pinRef = ""
+  }
+
+  // Asks for the key's PIN when the target needs it and none is held yet;
+  // `then()` runs with pinRef set, or not at all (failure is shown).
+  function withKeyPin(target, error, then) {
+    if (!target.needsPin || pinRef) { then(); return }
+    if (!vault.pinentryAvailable) {
+      scanning = false
+      message = ""
+      failure = pinUnavailableReason
+      return
+    }
+    message = "󰌋  Enter your key's PIN in pinentry..."
+    vault.requestPinentry("fidoPin", error, function(r) {
+      if (r.state === "ok") {
+        pinRef = Model.heldSecretRef(r.name)
+        if (scanning) then()
+        else forgetPin()
+        return
+      }
+      scanning = false
+      message = ""
+      failure = r.state === "cancelled" || r.state === "empty" || r.state === "short" ? ""
+        : "Could not ask for your key's PIN. Use your master password."
+    })
   }
 
   // -------------------------------------------------------------------------
@@ -188,19 +232,27 @@ Item {
       failure = unavailableReason()
       return
     }
-    assertMode = target.mode
-    startedAtMs = Date.now()
-    var tool = vault.envelopeTool()
-    var account = vault.envelopeAccount()
-    // The tool reads the account from the environment, not argv (this run is
-    // outside Service's envelope queue, which sets it for the others).
-    assertProc.environment = Model.envelopeAccountEnv(account)
-    assertProc.command = target.mode === "envelope"
-      ? Model.fidoUnlockCommand(tool, account, target)
-      : Model.fidoLegacyUnlockCommand(tool, account, target)
-    // The password it prints stays in the vault helper (vault.heldOutput()).
-    assertProc.capture = "secret:" + vault.newHeldName()
-    assertProc.running = true
+    withKeyPin(target, "", function() {
+      if (!scanning || !vault || vault.status !== "locked") return
+      message = busyRetries > 0 ? busyMessage : touchMessage
+      assertMode = target.mode
+      startedAtMs = Date.now()
+      var tool = vault.envelopeTool()
+      var account = vault.envelopeAccount()
+      // The tool reads the account from the environment, not argv (this run is
+      // outside Service's envelope queue, which sets it for the others).
+      assertProc.environment = Model.envelopeAccountEnv(account)
+      assertProc.command = target.mode === "envelope"
+        ? Model.fidoUnlockCommand(tool, account, target)
+        : Model.fidoLegacyUnlockCommand(tool, account, target)
+      // The key's PIN, when needed, goes to the pipeline's stdin by name.
+      var secrets = {}
+      if (target.needsPin) secrets[Model.fidoPinEnvVar()] = pinRef
+      assertProc.secrets = secrets
+      // The password it prints stays in the vault helper (vault.heldOutput()).
+      assertProc.capture = "secret:" + vault.newHeldName()
+      assertProc.running = true
+    })
   }
 
   // Leave the screen but keep the key's request running: stopping our side
@@ -229,6 +281,7 @@ Item {
     }
     scanning = false
     authorized = false
+    forgetPin()
   }
 
   // Failed too fast to be an answer, soon after this panel abandoned a request.
@@ -269,6 +322,7 @@ Item {
     }
 
     if (exitCode === 0 || exitCode === codes.legacyUsed) {
+      forgetPin()
       busyRetries = 0
       abandonedAtMs = 0
       authorized = false
@@ -292,10 +346,21 @@ Item {
         retryAfterBusy()
         return
       }
+      var withPin = pinRef !== ""
+      forgetPin()
       message = ""
       failure = (Date.now() - startedAtMs) > noTouchMs
         ? "No touch received. Touch your key again or use your master password."
-        : "Key not recognised. Touch it again or use your master password."
+        // A wrong PIN is refused by the key at once, and costs one of its
+        // tries; the user has to know which it was.
+        : (withPin ? "The key refused: a wrong PIN, or no touch. Each wrong PIN uses one of the key's tries."
+          : "Key not recognised. Touch it again or use your master password.")
+      return
+    }
+    forgetPin()
+    if (exitCode === codes.noPin) {
+      message = ""
+      failure = pinUnavailableReason
       return
     }
     if (exitCode === Model.legacyMigrationExitCodes().none) {
@@ -316,7 +381,7 @@ Item {
   // Processes whose output can hold the master password, for the lock scrub.
   function secretProcesses() { return [assertProc] }
 
-  function dropSecrets() { setupMaster = "" }
+  function dropSecrets() { setupMaster = ""; forgetPin() }
 
   // Clears the legacy entry, if any.
   function requestClear() {
@@ -345,6 +410,7 @@ Item {
   // State only: logout already cleared the keyring.
   function reset() {
     cancelUnlock()
+    forgetPin()
     busyRetries = 0
     abandonedAtMs = 0
     legacyStored = false
@@ -383,6 +449,7 @@ Item {
   function beginSetup() {
     setupMaster = ""
     error = ""
+    downgradeConfirmed = false
     setupActive = true
     // Probe even if the setting is off: the form needs to know whether a key
     // is registered.
@@ -421,18 +488,60 @@ Item {
       error = unavailableReason()
       return
     }
-    var target = { device: usable[0].device, cred: usable[0].cred, rp: probe.rp }
+    // A weaker method already in the envelope makes the key pointless; the
+    // form says so and asks for a second press (quickUnlockDowngradeWarning()).
+    if (vault.fidoDowngradeWarning && !downgradeConfirmed) {
+      downgradeConfirmed = true
+      error = Model.downgradeConfirmText(vault.fidoDowngradeWarning)
+      return
+    }
+    var target = { device: usable[0].device, cred: usable[0].cred, rp: probe.rp,
+      needsPin: usable[0].needsPin === true }
+    if (target.needsPin && !vault.pinentryAvailable) {
+      error = pinUnavailableReason
+      return
+    }
     var typed = setupMaster
     setupMaster = ""
     error = ""
     busy = true
     setupActive = true
+    if (!target.needsPin) {
+      enroll(typed, target, null)
+      return
+    }
+    // The key's PIN first, so the touch prompt follows it as on unlock.
+    message = "󰌋  Enter your key's PIN in pinentry..."
+    vault.requestPinentry("fidoPin", "", function(r) {
+      if (r.state !== "ok" || !setupActive || !busy) {
+        if (r.state === "ok") vault.forgetVaultSecret(r.name)
+        typed = ""
+        busy = false
+        message = ""
+        if (setupActive && r.state !== "cancelled" && r.state !== "empty" && r.state !== "short") {
+          error = "Could not ask for your key's PIN."
+        }
+        return
+      }
+      var extra = {}
+      extra[Model.fidoPinEnvVar()] = Model.heldSecretRef(r.name)
+      enroll(typed, target, extra)
+      typed = ""
+    })
+  }
+
+  property bool downgradeConfirmed: false
+
+  // The typed master password checked against the stored one, one touch
+  // adding this key's wrap; `extra` carries the held key PIN when needed.
+  function enroll(typed, target, extra) {
     message = "󰟵  Touch your FIDO2 key to finish..."
     startedAtMs = Date.now()
     vault.beginEpochOperation("fidoAdd")
     vault.addQuickUnlockMethodWith(typed, function(tool, account) {
       return Model.fidoEnrollCommand(tool, account, target)
-    }, null, function(ok, why, code) {
+    }, extra, function(ok, why, code) {
+      if (extra) for (var k in extra) vault.forgetHeldPassword(extra[k])
       typed = ""
       busy = false
       message = ""
@@ -446,7 +555,10 @@ Item {
       if (!ok) {
         var codes = Model.fidoExitCodes()
         if (why === "wrong-password" || why === "stale") error = vault.quickUnlockErrorText(why, "")
-        else if (code === codes.assert || code === codes.noSecret) error = "No touch received. Try again."
+        else if (code === codes.assert || code === codes.noSecret) {
+          error = target.needsPin ? "The key refused: a wrong PIN, or no touch. Try again."
+            : "No touch received. Try again."
+        } else if (code === codes.noPin) error = pinUnavailableReason
         else error = "Could not enable FIDO2 unlock. Is the OS keyring available?"
         setupActive = true
         return

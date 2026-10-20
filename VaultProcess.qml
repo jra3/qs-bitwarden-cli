@@ -24,6 +24,12 @@ Item {
   property bool session: true
   // More held values, { VAR: "secret:<name>" }.
   property var inject: ({})
+  // Values the run reads from stdin instead of its environment (the master
+  // password, a PIN, an hmac-secret): { NAME: value or a held reference }.
+  // Written as NUL-ended records ahead of `stdinText` (Model.secretBlock());
+  // null means none, and no block at all. A script that starts with
+  // Model.secretsPreamble() must get a block, even an empty one, or it waits.
+  property var secrets: null
   // Written to stdin, then closed.
   property string stdinText: ""
   // Whether the helper kept a session key from this run's output.
@@ -63,30 +69,35 @@ Item {
     vault.vaultStart(proc)
   }
 
-  // Called by the vault: run here instead of in the helper.
-  function runLocally(env) {
-    launchLocal(command, env, startSeq)
+  // Called by the vault: run here instead of in the helper. `input` is what
+  // the run reads from stdin: the secrets block, resolved here, then
+  // `stdinText`.
+  function runLocally(env, input) {
+    launchLocal(command, env, input, startSeq)
   }
 
   // The command is taken with its environment. A start deferred behind the
   // previous run's collector clear is dropped once replaced, and once
   // cancelled ends as a killed run would, so exited() still arrives.
-  function launchLocal(cmd, env, seq) {
+  function launchLocal(cmd, env, input, seq) {
     if (seq !== startSeq) return
     if (!running) {
       finish(143, "", "", false, false)
       return
     }
     if (local.running) {
-      Qt.callLater(function() { proc.launchLocal(cmd, env, seq) })
+      Qt.callLater(function() { proc.launchLocal(cmd, env, input, seq) })
       return
     }
     runId = -1
     local.command = cmd
     local.environment = env
-    local.stdinEnabled = stdinText !== ""
+    localInput = String(input || "")
+    local.stdinEnabled = localInput !== ""
     local.running = true
   }
+
+  property string localInput: ""
 
   // Called by the vault (or `local`) when the run has ended.
   function finish(code, out, err, heldSession, heldOutput) {
@@ -113,7 +124,8 @@ Item {
     stderr: StdioCollector { id: localErr; waitForEnd: true }
     onStarted: {
       if (stdinEnabled) {
-        write(proc.stdinText)
+        write(proc.localInput)
+        proc.localInput = ""
         stdinEnabled = false
       }
       proc.started()

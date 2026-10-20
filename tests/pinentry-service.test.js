@@ -371,7 +371,7 @@ check("the unlock hands the held name to the password flow",
   /unlockVaultWithPassword\(Model\.heldSecretRef\(r\.name\)\)/.test(body("unlockWithPinentry")), body("unlockWithPinentry"))
 check("the PIN unlock takes a held PIN, in place of the field, for both its paths",
   /function submitPinUnlock\(heldPin\)/.test(service)
-    && /env\[Model\.pinEnvVar\(\)\] = held \|\|/.test(body("submitPinUnlock"))
+    && /secrets\[Model\.pinEnvVar\(\)\] = held \|\|/.test(body("submitPinUnlock"))
     && /if \(!held && String\(pinEntry \|\| ""\)\.length < Model\.pinUnlockMinLength\(\)\)/.test(body("submitPinUnlock"))
     && /heldPinName \? Model\.heldSecretRef\(root\.heldPinName\) : root\.pinEntry/.test(service), body("submitPinUnlock"))
 check("a held PIN is forgotten when the envelope answers, and a held PIN for a migration after it",

@@ -159,16 +159,18 @@ check("Escape dismisses a waiting prompt first",
 // --- the check itself ------------------------------------------------------------------
 
 const verify = body("verifyMasterPassword")
-check("the stored copy answers first, silently, with the password in the environment",
+check("the stored copy answers first, silently, with the password on the run's stdin",
   /Model\.unlockEnvelopeCheckCommand\(envelopeTool\(\), envelopeAccount\(\)\)/.test(verify)
-    && /env\[Model\.keyringSecretEnvVar\(\)\] = pw/.test(verify) && !/secretOutput/.test(verify), verify)
+    && /secrets\[Model\.keyringSecretEnvVar\(\)\] = pw/.test(verify) && /secrets: secrets/.test(verify)
+    && !/env\[Model\.keyringSecretEnvVar/.test(verify) && !/secretOutput/.test(verify), verify)
 check("a stale stored copy is not trusted, and anything but a match goes to bw",
   /!envelopeSummary\.stale/.test(verify) && /if \(code === 0\) \{ done\(true\); return \}\s*root\.verifyWithBw\(pw/.test(verify),
   verify)
 const check0 = Model.unlockEnvelopeCheckCommand("/opt/tool", { id: "u", server: "https://s", slot: "default" })
 check("the check's command holds no secret and prints nothing",
   check0[2].includes('"$QSBW_SECRET"') && /\s>\/dev\/null$/.test(check0[2]), check0[2])
-check("bw's own check keeps the password out of argv",
-  /--passwordenv QSBW_SECRET/.test(Model.bwVerifyPasswordCommand()[2]), Model.bwVerifyPasswordCommand()[2])
+check("bw's own check keeps the password out of argv and out of every environment",
+  /--passwordfile <\(printf '%s' "\$QSBW_SECRET"\)/.test(Model.bwVerifyPasswordCommand()[2])
+    && !/passwordenv/.test(Model.bwVerifyPasswordCommand()[2]), Model.bwVerifyPasswordCommand()[2])
 
 done()

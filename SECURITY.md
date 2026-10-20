@@ -36,7 +36,9 @@ you to it.
   reaching disk, the journal, another process's argv or environment, or
   another user.
 - Opening the quick-unlock envelope without the PIN, key or fingerprint it is
-  protected by, beyond the limits the README documents.
+  protected by, beyond the limits the README documents; or a FIDO2 key being
+  asked for its hmac-secret by anything but the user pressing the unlock or
+  enable button.
 - The SSH agent signing without an approval, outside the grant's program, key,
   kind of signature or server, or for a forwarded request.
 - The bundled helpers (`bin/`) not matching their source, or a release whose

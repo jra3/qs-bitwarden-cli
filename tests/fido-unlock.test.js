@@ -98,11 +98,15 @@ check("a registered credential whose key is not plugged in is not usable",
   absentKey.ready === false && absentKey.usable.length === 0 && absentKey.credentials.length === 1,
   JSON.stringify(absentKey))
 const pinCred = Fido.parseFidoProbe(base + "cred=QUJD|+presence+pin|/dev/hidraw2\n")
-check("a registration that asks for the key's PIN is listed but never used",
-  pinCred.ready === false && pinCred.pinOnly === true && pinCred.credentials[0].needsPin === true,
+// A +pin registration is stronger, not unusable: the key's PIN is user
+// verification, and the wrap made with it cannot be opened by a touch alone.
+check("a registration that asks for the key's PIN is usable, and marked as needing it",
+  pinCred.ready === true && pinCred.usable.length === 1 && pinCred.usable[0].needsPin === true,
   JSON.stringify(pinCred))
-check("so is one that asks for user verification",
-  Fido.parseFidoProbe(base + "cred=QUJD|+verification|/dev/hidraw2\n").pinOnly === true, "")
+check("so is one that asks for user verification, which the PIN stands in for",
+  Fido.parseFidoProbe(base + "cred=QUJD|+verification|/dev/hidraw2\n").usable[0].needsPin === true, "")
+check("a touch-only registration does not need one",
+  withCred.usable[0].needsPin === false && !("pinOnly" in withCred), JSON.stringify(withCred))
 check("a credential id that is not base64 is dropped",
   Fido.parseFidoProbe(base + "cred=a'b|+presence|/dev/hidraw2\n").credentials.length === 0, "")
 check("a relying party that is not pam://<host> is not trusted",
@@ -229,16 +233,28 @@ check("the retry stops when the screen that wanted it is gone",
   /id: busyRetryTimer[\s\S]{0,500}?status !== "locked"[\s\S]{0,120}?sshAuthSurfaceActive[\s\S]{0,120}?busyRetries = 0/.test(rawFidoUnlock),
   "a closed panel must not keep re-arming the key")
 check("a successful touch clears the busy state",
-  /exitCode === codes\.legacyUsed\) \{\s*busyRetries = 0\s*abandonedAtMs = 0/.test(rawFidoUnlock),
+  /exitCode === codes\.legacyUsed\) \{\s*forgetPin\(\)\s*busyRetries = 0\s*abandonedAtMs = 0/.test(rawFidoUnlock),
   "the next lock must start from a clean count")
 check("locking with the panel open arms whichever gate is about to be offered",
   /function lockVault\(\)[\s\S]{0,1200}?if \(sshAuthSurfaceActive\) armPresenceUnlock\(\)/.test(rawService)
     && !/function lockVault\(\)[\s\S]{0,1200}?if \(sshAuthSurfaceActive\) startFingerprintUnlock\(\)/.test(rawService),
   "arming the reader with a key plugged in sends the touch to the focused field")
-check("the form arms the method it offers, so no caller has to remember to",
-  /function armOfferedMethod\(\)[\s\S]{0,400}?startFidoUnlock\(\)[\s\S]{0,120}?startFingerprintUnlock\(\)/
-    .test(read("UnlockForm.qml")),
-  "a presence method on screen with nothing waiting behind it is the bug this prevents")
+// The key is never armed by a screen appearing: a request left on it is
+// answered by the next touch, whatever that touch was for (a sudo prompt, an
+// SSH login), and one such touch is a reusable secret. Only the button asks.
+const armBody = (rawService.match(/function armPresenceUnlock\(\) \{[\s\S]*?\n  \}/) || [""])[0]
+check("a screen appearing never arms the key; only the reader, and only when the key is not on offer",
+  !/startFidoUnlock/.test(armBody) && /if \(fidoReady\) return/.test(armBody) && /startFingerprintUnlock\(\)/.test(armBody),
+  armBody)
+const formArm = (read("UnlockForm.qml").match(/function armOfferedMethod\(\) \{[\s\S]*?\n  \}/) || [""])[0]
+check("the form arms the reader it offers, and never the key",
+  /startFingerprintUnlock\(\)/.test(formArm) && !/startFidoUnlock/.test(formArm), formArm)
+check("a probe or legacy check finishing does not start a request either",
+  !/function onHasChecked[\s\S]{0,400}?startUnlock\(\)/.test(rawFidoUnlock)
+    && !/function onProbe[\s\S]{0,400}?startUnlock\(\)/.test(rawFidoUnlock), "")
+check("the unlock button is the one caller, and the form says so",
+  /onClicked: form\.vault\.startFidoUnlock\(\)/.test(rawUnlockForm)
+    && /Nothing is asked of the key until you press this/.test(rawUnlockForm), "")
 check("only one presence gate is ever armed",
   /function startFidoUnlock\(\)[\s\S]{0,300}?cancelFingerprintUnlock\(\)/.test(rawService)
     && /function startFingerprintUnlock\(\)[\s\S]{0,500}?fidoUnlocker\.releaseSurface\(\)/.test(rawService),
@@ -283,7 +299,7 @@ check("the assert run gets the active account's environment",
     && Model.envelopeAccountEnv({ id: "acct-1", server: "https://v.example" }).QSBW_ACCOUNT_ID === "acct-1"
     && Model.envelopeAccountEnv({ id: "acct-1", server: "https://v.example" }).QSBW_SERVER === "https://v.example", "")
 check("its command is set fresh before every run, never left to the scrub's leftover",
-  /assertProc\.command = target\.mode === "envelope"[\s\S]{0,400}?assertProc\.running = true/.test(controllerSrc)
+  /assertProc\.command = target\.mode === "envelope"[\s\S]{0,700}?assertProc\.running = true/.test(controllerSrc)
     && !/if \(!assertProc\.running\) assertProc\.running = true/.test(controllerSrc), "")
 check("which key holds the credential is asked again before each touch",
   /startAfterProbe = true\s*\n\s*if \(!probeProc\.running\) probeProc\.running = true/.test(controllerSrc)
@@ -294,12 +310,44 @@ check("a credential with a wrap is preferred; the plaintext entry only migrates"
     .test(controllerSrc), "")
 check("a migrating touch drops the plaintext entry once the envelope has it",
   /var migrated = exitCode === 0 && mode === "legacy"\s*if \(migrated\) \{[\s\S]{0,250}?legacyStored = false/.test(controllerSrc), "")
-check("a PIN-requiring registration gets a reason, not a failed touch",
-  /if \(probe\.pinOnly\)[\s\S]{0,200}?asks for its PIN/.test(controllerSrc), "")
+// --- the key's PIN -----------------------------------------------------------
+//
+// A +pin registration gets its PIN from pinentry under the vault helper, held
+// by name and handed to the pipeline on stdin; the panel's own field is never
+// offered for it, and the held PIN is forgotten with the attempt.
+check("a PIN registration asks pinentry for the key's PIN before the key is asked",
+  /function withKeyPin\(target, error, then\)[\s\S]{0,900}?vault\.requestPinentry\("fidoPin"/.test(controllerSrc)
+    && /withKeyPin\(target, "", function\(\) \{[\s\S]{0,1200}?assertProc\.running = true/.test(controllerSrc), "")
+check("the PIN reaches the pipeline on stdin by held name, never as a value in the shell",
+  /secrets\[Model\.fidoPinEnvVar\(\)\] = pinRef/.test(controllerSrc)
+    && /pinRef = Model\.heldSecretRef\(r\.name\)/.test(controllerSrc)
+    && !/assertProc\.environment = (?!Model\.envelopeAccountEnv\(account\)\s*\n)/.test(controllerSrc), "")
+check("without pinentry the PIN is not collected at all",
+  /if \(!vault\.pinentryAvailable\)[\s\S]{0,200}?failure = pinUnavailableReason/.test(controllerSrc)
+    && /pinentry is off, missing or waiting for the vault helper/.test(controllerSrc), "")
+check("the held PIN is forgotten with the attempt, whichever way it ends",
+  /function cancelUnlock\(\)[\s\S]{0,400}?forgetPin\(\)/.test(controllerSrc)
+    && /function reset\(\)[\s\S]{0,100}?forgetPin\(\)/.test(controllerSrc)
+    && (controllerSrc.match(/forgetPin\(\)/g) || []).length >= 6, "")
+check("a wrong PIN is named, since each one costs a try on the key",
+  /wrong PIN, or no touch\. Each wrong PIN uses one of the key's tries/.test(controllerSrc), "")
+check("enrolment asks for the PIN the same way and hands it to the shared enable path",
+  /vault\.requestPinentry\("fidoPin", "", function\(r\)[\s\S]{0,600}?extra\[Model\.fidoPinEnvVar\(\)\] = Model\.heldSecretRef\(r\.name\)[\s\S]{0,100}?enroll\(typed, target, extra\)/
+    .test(controllerSrc)
+    && /function enroll\(typed, target, extra\)[\s\S]{0,300}?vault\.addQuickUnlockMethodWith\(typed, function\(tool, account\) \{\s*return Model\.fidoEnrollCommand\(tool, account, target\)/
+      .test(controllerSrc), "")
+check("pinentry knows the purpose",
+  /Key PIN:/.test(Model.pinentryPrompt("fidoPin")) && /FIDO2 key's PIN/.test(Model.pinentryDescription("fidoPin", ""))
+    && Model.fidoPinMinLength() === 4, "")
+// --- a weaker method beside the key ---------------------------------------------
+check("enabling the key beside a fingerprint or PIN wrap warns and asks for a second press",
+  /if \(vault\.fidoDowngradeWarning && !downgradeConfirmed\) \{\s*downgradeConfirmed = true\s*error = Model\.downgradeConfirmText/.test(controllerSrc)
+    && /vault\.fidoDowngradeWarning !== ""/.test(read("FidoSetupScreen.qml")), "")
 check("setup is a master-password check and one touch, through the vault's shared path",
   /vault\.addQuickUnlockMethodWith\(typed, function\(tool, account\) \{\s*return Model\.fidoEnrollCommand\(tool, account, target\)/
     .test(controllerSrc)
-    && /var typed = setupMaster\s*\n\s*setupMaster = ""/.test(controllerSrc), "")
+    && /var typed = setupMaster\s*\n\s*setupMaster = ""/.test(controllerSrc)
+    && /if \(!target\.needsPin\) \{\s*enroll\(typed, target, null\)/.test(controllerSrc), "")
 check("a wrap whose setup was abandoned, locked or logged out mid-write is removed",
   /vault\.epochOperationIsStale\("fidoAdd"\) \|\| !setupActive\)[\s\S]{0,200}?removeQuickUnlockMethod\(\{ kind: "remove", method: "fido", cred: target\.cred \}\)/
     .test(controllerSrc)

@@ -54,9 +54,13 @@ function fidoProbeCommand() {
 }
 
 // Missing fields read as false, so a partial probe is never "ready".
-// `applicable`: whether to show the settings row at all. Credentials
-// registered with `+pin`/`+verification` are listed but not used: this unlock
-// cannot collect the key's PIN, and a touch alone would be weaker.
+// `applicable`: whether to show the settings row at all. A credential
+// registered with `+pin` or `+verification` is usable too, with
+// `needsPin`: the key's PIN goes to fido2-assert as user verification
+// (BitwardenModel.js fidoAssertScript()), which is what the registration
+// asks of the system's own prompts, and the key then answers from a secret a
+// touch alone never yields. `+verification` means the key's own check,
+// which on a key without one its PIN stands in for.
 function parseFidoProbe(raw) {
   var found = {}
   var creds = []
@@ -82,8 +86,7 @@ function parseFidoProbe(raw) {
   var registered = found["fido_registered"] === "1"
   var tokenPresent = found["fido_token"] === "1"
   var rp = /^pam:\/\/[A-Za-z0-9.-]+$/.test(found["rp"] || "") ? found["rp"] : ""
-  var usable = creds.filter(function(c) { return c.device !== "" && !c.needsPin })
-  var pinOnly = creds.some(function(c) { return c.device !== "" && c.needsPin }) && usable.length === 0
+  var usable = creds.filter(function(c) { return c.device !== "" })
   return {
     installed: installed,
     registered: registered,
@@ -91,7 +94,6 @@ function parseFidoProbe(raw) {
     rp: rp,
     credentials: creds,
     usable: usable,
-    pinOnly: pinOnly,
     ready: installed && registered && tokenPresent && rp !== "" && usable.length > 0,
     applicable: installed || registered || tokenPresent
   }

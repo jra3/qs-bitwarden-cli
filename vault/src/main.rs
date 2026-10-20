@@ -233,11 +233,23 @@ impl Helper {
                 argv,
                 env,
                 inject,
+                secrets,
+                held_secrets,
                 capture,
                 stdin,
                 detach,
                 ..
-            } => self.exec(id, argv, env, inject, capture.as_deref(), stdin, detach),
+            } => self.exec(
+                id,
+                argv,
+                env,
+                inject,
+                secrets,
+                held_secrets,
+                capture.as_deref(),
+                stdin,
+                detach,
+            ),
             Request::Kill { id, .. } => {
                 let runs = self.runs.lock().unwrap();
                 if let Some(group) = runs.get(&id).copied() {
@@ -328,6 +340,8 @@ impl Helper {
         argv: Vec<String>,
         env: BTreeMap<String, Option<String>>,
         inject: BTreeMap<String, String>,
+        secrets: Option<BTreeMap<String, String>>,
+        held_secrets: BTreeMap<String, String>,
         capture: Option<&str>,
         stdin: Option<String>,
         detach: bool,
@@ -337,6 +351,11 @@ impl Helper {
             .into_iter()
             .map(|(k, v)| (k, v.map(Zeroizing::new)))
             .collect();
+        let secrets: Option<Vec<(String, Zeroizing<String>)>> = secrets.map(|map| {
+            map.into_iter()
+                .map(|(k, v)| (k, Zeroizing::new(v)))
+                .collect()
+        });
         let refuse = |reason: &str| {
             self.send(
                 json!({ "type": "exit", "id": id, "code": EXIT_REFUSED, "out": "", "err": reason }),
@@ -348,6 +367,11 @@ impl Helper {
         if argv.is_empty()
             || env.iter().any(|(k, _)| !control::valid_env_name(k))
             || inject.keys().any(|k| !control::valid_env_name(k))
+            || secrets
+                .iter()
+                .flatten()
+                .any(|(k, _)| !control::valid_env_name(k))
+            || held_secrets.keys().any(|k| !control::valid_env_name(k))
         {
             return refuse("malformed command");
         }
@@ -363,6 +387,9 @@ impl Helper {
         // Read under the lock that resolves the injected values, so the run
         // holds exactly the vault whose key it was given.
         let generation;
+        // What the run reads from stdin: the secrets block, if any, then the
+        // panel's text. Built here so no secret is resolved twice.
+        let mut input: Option<Zeroizing<Vec<u8>>> = None;
         {
             let store = self.store.lock().unwrap();
             generation = store.generation();
@@ -377,7 +404,31 @@ impl Helper {
                     command.env(name, value);
                 }
             }
+            if secrets.is_some() || !held_secrets.is_empty() {
+                let mut records: Vec<(&str, &str)> = Vec::new();
+                for (name, value) in secrets.iter().flatten() {
+                    records.push((name.as_str(), value.as_str()));
+                }
+                for (name, source) in &held_secrets {
+                    let value = match control::parse_source(source) {
+                        Some(Source::Session) => store.session(),
+                        Some(Source::Secret(secret)) => store.secret(secret),
+                        None => return refuse("unknown inject source"),
+                    };
+                    // Absent: left out, and the script reports the missing
+                    // secret as the tool does.
+                    if let Some(value) = value {
+                        records.push((name.as_str(), value));
+                    }
+                }
+                input = Some(Zeroizing::new(control::secret_block(records)));
+            }
         }
+        if let Some(text) = stdin {
+            let bytes = input.get_or_insert_with(|| Zeroizing::new(Vec::new()));
+            bytes.extend_from_slice(text.as_bytes());
+        }
+        let stdin = input;
 
         if detach {
             let Some(slot) = Slot::claim(&self.detached, MAX_DETACHED) else {
@@ -450,7 +501,7 @@ impl Helper {
 fn run(
     id: u64,
     mut child: Child,
-    stdin: Option<Zeroizing<String>>,
+    stdin: Option<Zeroizing<Vec<u8>>>,
     capture: Capture,
     generation: u64,
     store: Shared<Store>,
@@ -459,7 +510,7 @@ fn run(
 ) {
     if let (Some(input), Some(mut pipe)) = (stdin, child.stdin.take()) {
         thread::spawn(move || {
-            let _ = pipe.write_all(input.as_bytes());
+            let _ = pipe.write_all(&input);
         });
     }
     let stderr = child

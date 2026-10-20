@@ -4,7 +4,9 @@
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
-pub const PROTOCOL: u8 = 1;
+/// 2 added `secrets` and `heldSecrets` to `exec`: a value that must not sit
+/// in any child's environment.
+pub const PROTOCOL: u8 = 2;
 /// A save carries the item in `env`, and the list read's filter is the
 /// longest script; 4 MiB is far past both.
 pub const MAX_LINE: usize = 4 * 1024 * 1024;
@@ -18,6 +20,17 @@ pub enum Request {
     /// Run `argv` as the panel would, with `BW_SESSION` or a held secret
     /// added to its environment by name (`inject`), and deal with its stdout
     /// as `capture` says.
+    ///
+    /// `secrets` and `heldSecrets` are values the run needs but which must
+    /// not be in its environment, where every process of the same user can
+    /// read them for the life of the run and of every child that inherits
+    /// them: the master password, a PIN, a FIDO2 hmac-secret. They are
+    /// written to the run's stdin ahead of `stdin`, as `NAME=value` records
+    /// ended by NUL and closed by an empty record (`secret_block()`), for the
+    /// shell to read into unexported variables. `secrets` are given values,
+    /// `heldSecrets` name held ones as `inject` does. The block is written
+    /// whenever `secrets` is present, even empty, so a script that reads one
+    /// never waits on a stdin nobody writes.
     Exec {
         v: u8,
         id: u64,
@@ -26,6 +39,10 @@ pub enum Request {
         env: BTreeMap<String, Option<String>>,
         #[serde(default)]
         inject: BTreeMap<String, String>,
+        #[serde(default)]
+        secrets: Option<BTreeMap<String, String>>,
+        #[serde(default, rename = "heldSecrets")]
+        held_secrets: BTreeMap<String, String>,
         #[serde(default)]
         capture: Option<String>,
         #[serde(default)]
@@ -200,6 +217,23 @@ pub fn valid_env_name(name: &str) -> bool {
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
+/// The stdin block carrying `records` to a run: `NAME=value` ended by NUL
+/// each, then an empty record. A value never holds NUL (it came from JSON
+/// text or a `bw` answer, both of which the helper reads as strings without
+/// one), so the shell's `read -r -d ''` sees each record whole, newlines
+/// and all.
+pub fn secret_block<'a>(records: impl IntoIterator<Item = (&'a str, &'a str)>) -> Vec<u8> {
+    let mut block = Vec::new();
+    for (name, value) in records {
+        block.extend_from_slice(name.as_bytes());
+        block.push(b'=');
+        block.extend_from_slice(value.as_bytes());
+        block.push(0);
+    }
+    block.push(0);
+    block
+}
+
 pub fn parse(line: &str) -> Result<Request, &'static str> {
     if line.len() > MAX_LINE {
         return Err("line too long");
@@ -218,33 +252,72 @@ mod tests {
     #[test]
     fn requests_are_strict() {
         assert!(matches!(
-            parse(r#"{"type":"hello","v":1}"#),
+            parse(r#"{"type":"hello","v":2}"#),
             Ok(Request::Hello { .. })
         ));
-        assert!(parse(r#"{"type":"hello","v":2}"#).is_err());
-        assert!(parse(r#"{"type":"hello","v":1,"extra":true}"#).is_err());
-        assert!(parse(r#"{"type":"unknown","v":1}"#).is_err());
+        assert!(parse(r#"{"type":"hello","v":1}"#).is_err());
+        assert!(parse(r#"{"type":"hello","v":2,"extra":true}"#).is_err());
+        assert!(parse(r#"{"type":"unknown","v":2}"#).is_err());
         assert!(matches!(
-            parse(r#"{"type":"forgetItem","v":1,"id":"a"}"#),
+            parse(r#"{"type":"forgetItem","v":2,"id":"a"}"#),
             Ok(Request::ForgetItem { .. })
         ));
-        assert!(parse(r#"{"type":"forgetItem","v":1,"id":"a","extra":1}"#).is_err());
-        assert!(parse(r#"{"type":"forgetItem","v":2,"id":"a"}"#).is_err());
+        assert!(parse(r#"{"type":"forgetItem","v":2,"id":"a","extra":1}"#).is_err());
+        assert!(parse(r#"{"type":"forgetItem","v":1,"id":"a"}"#).is_err());
         let exec = parse(
-            r#"{"type":"exec","v":1,"id":3,"argv":["bw","status"],"inject":{"BW_SESSION":"session"},"env":{"A":"b","C":null}}"#,
+            r#"{"type":"exec","v":2,"id":3,"argv":["bw","status"],"inject":{"BW_SESSION":"session"},"env":{"A":"b","C":null}}"#,
         );
         assert!(matches!(exec, Ok(Request::Exec { id: 3, .. })));
     }
 
     #[test]
+    fn secrets_ride_beside_the_environment() {
+        // Absent: no block. Present and empty: a block of just the end record.
+        let bare = parse(r#"{"type":"exec","v":2,"id":1,"argv":["bash"]}"#);
+        assert!(matches!(
+            bare,
+            Ok(Request::Exec { secrets: None, ref held_secrets, .. }) if held_secrets.is_empty()
+        ));
+        let with = parse(
+            r#"{"type":"exec","v":2,"id":1,"argv":["bash"],"secrets":{"QSBW_SECRET":"pw"},"heldSecrets":{"QSBW_PIN":"secret:pw3"}}"#,
+        );
+        match with {
+            Ok(Request::Exec {
+                secrets: Some(secrets),
+                held_secrets,
+                ..
+            }) => {
+                assert_eq!(secrets.get("QSBW_SECRET").map(String::as_str), Some("pw"));
+                assert_eq!(
+                    held_secrets.get("QSBW_PIN").map(String::as_str),
+                    Some("secret:pw3")
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        // The old protocol number is refused: its helper would have put these
+        // values in the environment.
+        assert!(parse(r#"{"type":"exec","v":1,"id":1,"argv":["bash"]}"#).is_err());
+    }
+
+    #[test]
+    fn the_block_is_nul_ended_records_closed_by_an_empty_one() {
+        assert_eq!(secret_block([]), b"\0");
+        assert_eq!(
+            secret_block([("A", "x=y\n"), ("B_2", "")]),
+            b"A=x=y\n\0B_2=\0\0"
+        );
+    }
+
+    #[test]
     fn field_requests_are_strict() {
-        let field = parse(r#"{"type":"field","v":1,"q":4,"id":"a","field":"notes"}"#);
+        let field = parse(r#"{"type":"field","v":2,"q":4,"id":"a","field":"notes"}"#);
         assert!(matches!(&field, Ok(Request::Field { q: 4, field, .. }) if field == "notes"));
-        assert!(parse(r#"{"type":"field","v":1,"q":4,"id":"a"}"#).is_err());
-        assert!(parse(r#"{"type":"field","v":1,"q":4,"id":"a","field":"notes","x":1}"#).is_err());
-        assert!(parse(r#"{"type":"field","v":2,"q":4,"id":"a","field":"notes"}"#).is_err());
+        assert!(parse(r#"{"type":"field","v":2,"q":4,"id":"a"}"#).is_err());
+        assert!(parse(r#"{"type":"field","v":2,"q":4,"id":"a","field":"notes","x":1}"#).is_err());
+        assert!(parse(r#"{"type":"field","v":1,"q":4,"id":"a","field":"notes"}"#).is_err());
         let copy =
-            parse(r#"{"type":"copyField","v":1,"q":5,"id":"a","field":"cardCode","clearSec":30}"#);
+            parse(r#"{"type":"copyField","v":2,"q":5,"id":"a","field":"cardCode","clearSec":30}"#);
         assert!(matches!(
             copy,
             Ok(Request::CopyField {
@@ -254,9 +327,9 @@ mod tests {
             })
         ));
         // A copy names its clear time, and it is not negative.
-        assert!(parse(r#"{"type":"copyField","v":1,"q":5,"id":"a","field":"cardCode"}"#).is_err());
+        assert!(parse(r#"{"type":"copyField","v":2,"q":5,"id":"a","field":"cardCode"}"#).is_err());
         assert!(parse(
-            r#"{"type":"copyField","v":1,"q":5,"id":"a","field":"cardCode","clearSec":-1}"#
+            r#"{"type":"copyField","v":2,"q":5,"id":"a","field":"cardCode","clearSec":-1}"#
         )
         .is_err());
         assert!(parse(

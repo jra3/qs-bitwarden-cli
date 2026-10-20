@@ -53,10 +53,13 @@ you to it.
   hit the default 8 MiB `RLIMIT_MEMLOCK`), so the kernel may write a page
   holding a decrypted key or the session key to swap. Use encrypted swap, or
   zram with no disk swap, if that matters to you.
-- Secrets the shell itself has held (what you type or reveal) appearing in a
-  shell core dump. The plugin does not lower the shell's core-file limit,
-  because the limit would also apply to every other shell plugin and every app
-  the shell starts; see docs/vault-helper.md.
+- Secrets the shell itself has held (what you type into its own fields or
+  reveal) appearing in a shell core dump. With pinentry in use the master
+  password and PIN are never typed into the shell, on any screen; the login
+  email, API-key fields, two-step codes and item fields still are. The plugin
+  does not lower the shell's core-file limit, because the limit would also
+  apply to every other shell plugin and every app the shell starts; see
+  docs/vault-helper.md.
 - The address of a link you open from an item. The browser has to be given
   it, so it is an argument to `xdg-open` and, when that starts the browser,
   to the browser for as long as it runs, where other local users can read it.

@@ -55,9 +55,10 @@ is released. Deleting the directory by hand is also safe once no helper is
 running.
 
 Two more paths are written but need no cleaning up, because neither outlives
-the moment it is used: the session handoff file under `$XDG_RUNTIME_DIR`, which
-is read once and deleted and is on a tmpfs that goes with the login session,
-and a `.qsbw-` staging directory inside your download folder, which exists only
+the moment it is used: the session handoff pipe under `$XDG_RUNTIME_DIR`, a
+named pipe (no key is ever written to it as a file) that is removed once
+read, or by the terminal that made it after ten minutes, on a tmpfs that
+goes with the login session, and a `.qsbw-` staging directory inside your download folder, which exists only
 for the length of an attachment download and is removed however that download
 ends. Saved attachments themselves stay where you saved them, mode `600`.
 

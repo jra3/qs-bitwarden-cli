@@ -443,7 +443,7 @@ var MAX_FOLDERS_BYTES = 2 * 1024 * 1024     // 2 MB: folder list
 var MAX_ORGS_BYTES = 2 * 1024 * 1024        // 2 MB: organizations list
 var MAX_STATUS_BYTES = 64 * 1024            // 64 KB: status json
 var MAX_TOKEN_BYTES = 4096                  // 4 KB: session token / password / TOTP
-var MAX_HANDOFF_BYTES = 4096                // 4 KB: session handoff file
+var MAX_HANDOFF_BYTES = 4096                // 4 KB: session handoff pipe
 var MAX_ASSOC_BYTES = 1024 * 1024           // 1 MB: learned associations file
 var MAX_STDERR_BYTES = 8192                 // 8 KB: diagnostic stderr output
 var MAX_MISC_BYTES = 64 * 1024              // 64 KB: create/edit/delete responses
@@ -1061,12 +1061,19 @@ function apiKeyLoginCommand(serverUrl) {
 // -------------------------------------------------------------------------
 //
 // `bw login` in a terminal handles what the panel cannot (SSO, Duo, hardware
-// keys). The terminal writes its session key to a file under XDG_RUNTIME_DIR,
-// which the panel reads once and deletes. `--raw` keeps prompts on stderr.
+// keys). The terminal hands its session key to the panel through a FIFO under
+// XDG_RUNTIME_DIR: the key waits in the terminal shell's memory, with a
+// writer blocked on the pipe, until the panel reads it, and nothing is ever
+// written to the filesystem (the runtime directory is a tmpfs, but a tmpfs
+// can be swapped, and a file there outlived the login by up to ten minutes).
+// `--raw` keeps prompts on stderr.
 
-// No /tmp fallback if XDG_RUNTIME_DIR is unset: fail closed rather than write
+// No /tmp fallback if XDG_RUNTIME_DIR is unset: fail closed rather than put
 // a session key somewhere world-writable.
 var HANDOFF_BASENAME = "session-handoff"
+// How long the writer waits for the panel before giving up, matching the
+// window in which the panel reads (HANDOFF_WINDOW_MS).
+var HANDOFF_WRITER_WAIT_SEC = 600
 
 // `mode` is "login" or "unlock"; the panel already knows which, so no slow
 // `bw status` probe first. `slot` is the account's (a detached terminal gets
@@ -1075,22 +1082,35 @@ function terminalLoginCommand(mode, serverUrl, slot) {
   var verb = (mode === "unlock") ? "unlock" : "login"
   var configureServer = verb === "login" ? serverConfigPrefix(serverUrl) : ""
   var inner = "set -u; " + accountAppDataExport(slot) + appDataDirPrelude()
-    + "d=\"${XDG_RUNTIME_DIR:?no XDG_RUNTIME_DIR -- refusing to write a session key}/"
+    + "d=\"${XDG_RUNTIME_DIR:?no XDG_RUNTIME_DIR -- refusing to hand over a session key}/"
     + RUNTIME_SUBDIR + "\"; f=\"$d/" + HANDOFF_BASENAME + "\"; "
     // umask before mkdir so the dir is created 0700; a failed chmod means the
     // dir is not ours.
     + "umask 077; " + privateDirScript("d")
-    // Remove a stale entry before opening the output path, so a pre-created
-    // symlink is unlinked rather than followed by shell redirection.
+    // Remove a stale entry before making the pipe, so a pre-created symlink
+    // or file is unlinked rather than used; mkfifo refuses to replace one.
     + "rm -f -- \"$f\" || exit 1; "
     // Argv, as `bw config server` needs (see serverConfigPrefix()).
     + configureServer
-    + "if bw " + verb + " --raw > \"$f\" && [ -s \"$f\" ]; then "
+    // The key lands in this shell's memory, not in a file. `--raw` prints only
+    // the key on stdout; the prompts are on stderr and the terminal.
+    + "if __key=\"$(bw " + verb + " --raw)\" && [ -n \"$__key\" ] && mkfifo -m 600 -- \"$f\"; then "
+    // A writer blocked on the pipe until the panel opens it, bounded by a
+    // reaper that also removes the pipe, both deaf to the terminal closing.
+    // Neither keeps the terminal's stdout, so the terminal is not held open
+    // by them. printf is a builtin: the key is in no process's arguments.
+    + "( trap '' HUP; printf '%s' \"$__key\" > \"$f\" ) >/dev/null 2>&1 & __w=$!; "
+    + "( trap '' HUP; sleep " + HANDOFF_WRITER_WAIT_SEC + "; kill \"$__w\" 2>/dev/null; rm -f -- \"$f\" ) >/dev/null 2>&1 & "
+    + "__key=''; "
     // Bring the panel back itself rather than making the user find it again.
     // Only the method name crosses this boundary; the key never does.
     + "omarchy-shell io.github.elevate08.qs-bitwarden-cli open >/dev/null 2>&1 || true; "
-    + "echo; echo 'Done. Returning to the Bitwarden panel...'; sleep 1; "
-    + "else rm -f \"$f\"; echo; echo 'Not completed -- nothing was handed to the panel.'; "
+    + "echo; echo 'Done. Returning to the Bitwarden panel...'; "
+    // Stay up a few seconds while the panel takes the key, so the terminal
+    // closes after the hand-over rather than mid-way; the writer waits on
+    // without it if the panel is slower.
+    + "__n=0; while kill -0 \"$__w\" 2>/dev/null && [ \"$__n\" -lt 20 ]; do sleep 0.25; __n=$((__n + 1)); done; "
+    + "else __key=''; rm -f -- \"$f\"; echo; echo 'Not completed -- nothing was handed to the panel.'; "
     + "read -p 'Press enter to close...'; fi"
   var script = "omarchy launch terminal -e bash -c " + shellQuote(inner)
     + " || alacritty -e bash -c " + shellQuote(inner)
@@ -1123,20 +1143,24 @@ function handoffWindowOpen(startedAt, now) {
   return windowOpen(startedAt, now, HANDOFF_WINDOW_MS)
 }
 
-// Reads and deletes the handoff file. The key is only read while `expecting`
-// (shortly after we launched a terminal login), so no other process can hand
-// the panel a session key at a time of its choosing; the file is deleted
-// either way. A missing runtime dir means nothing was handed over.
+// Reads from the handoff pipe and removes it. The key is only read while
+// `expecting` (shortly after we launched a terminal login), so no other
+// process can hand the panel a session key at a time of its choosing; the
+// pipe is removed either way, and so is anything that is not a pipe at that
+// path (a file an older version left). Opening a pipe nobody is writing
+// would block, so the read is bounded. A missing runtime dir means nothing
+// was handed over.
 function sessionHandoffReadCommand(expecting) {
   var script = "d=\"${XDG_RUNTIME_DIR:-}\"; [ -n \"$d\" ] || exit 0; "
     + "d=\"$d/" + RUNTIME_SUBDIR + "\"; "
     + "[ -d \"$d\" ] && [ ! -L \"$d\" ] || exit 0; "
     + "f=\"$d/" + HANDOFF_BASENAME + "\"; "
-    + "[ -s \"$f\" ] && [ -f \"$f\" ] && [ ! -L \"$f\" ] || exit 0; "
+    + "[ -e \"$f\" ] || [ -L \"$f\" ] || exit 0; "
+    + "[ -p \"$f\" ] && [ ! -L \"$f\" ] || { rm -f -- \"$f\"; exit 0; }; "
   if (expecting) {
-    script += "head -c " + MAX_HANDOFF_BYTES + " \"$f\"; "
+    script += "timeout 5 head -c " + MAX_HANDOFF_BYTES + " -- \"$f\"; "
   }
-  script += "rm -f \"$f\""
+  script += "rm -f -- \"$f\""
   return ["bash", "-c", script]
 }
 

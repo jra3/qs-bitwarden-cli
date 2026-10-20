@@ -8,7 +8,7 @@ const { createSuite, loadModule, read, readPluginSource, functionBody } = requir
 const fs = require("fs")
 const path = require("path")
 const os = require("os")
-const { execFileSync } = require("child_process")
+const { execFileSync, spawn } = require("child_process")
 const panelSrc = readPluginSource("Service.qml")
 
 const Model = loadModule()
@@ -139,7 +139,6 @@ check("sed is unbuffered, so the token is not held back past the suspend",
 // inhibitor is held until that ack, or the cap if none comes, and the loop is
 // ready for the next suspend either way. The monitor runs as it does in the
 // shell: its own process group, stdin a pipe the owner holds.
-const { spawn } = require("child_process")
 const work = fs.mkdtempSync(path.join(os.tmpdir(), "qsbw-lock-"))
 const log = path.join(work, "inhibit.log")
 // Real gdbus is a single process, so the stub execs its wait rather than
@@ -307,7 +306,8 @@ check("an unexpected handoff is still removed",
 check("an expected handoff is removed once consumed",
   expecting.includes("rm -f"), expecting)
 
-// Both forms, run for real against a planted file.
+// Both forms, run for real against a pipe with a writer waiting on it, as the
+// terminal leaves one.
 {
   const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "qsbw-handoff-"))
   try {
@@ -320,18 +320,43 @@ check("an expected handoff is removed once consumed",
       ["expected", expecting, KEY],
       ["unexpected", discarding, ""],
     ]) {
-      fs.writeFileSync(file, KEY)
+      execFileSync("mkfifo", ["-m", "600", file])
+      const writer = spawn("bash", ["-c", 'printf "%s" "$KEY" > "$1"', "_", file],
+        { env: { PATH: process.env.PATH, KEY }, stdio: "ignore" })
       const out = execFileSync("bash", ["-c", script],
         { encoding: "utf8", env: { ...process.env, XDG_RUNTIME_DIR: runtime } })
       check(`an ${label} handoff returns ${wantOut ? "the key" : "nothing"}`,
         out.trim() === wantOut, JSON.stringify(out))
-      check(`an ${label} handoff leaves no file behind`,
-        !fs.existsSync(file), "file still present")
+      check(`an ${label} handoff leaves no pipe behind`,
+        !fs.existsSync(file), "pipe still present")
+      // An unexpected handoff's writer is left waiting on a pipe that is gone.
+      writer.kill()
     }
+
   } finally {
     fs.rmSync(runtime, { recursive: true, force: true })
   }
 }
+
+// A pipe nobody is writing: the read is bounded, and the pipe goes. Run
+// without blocking, so the suspend checks' timing above is not disturbed.
+const noWriterCheck = new Promise(resolve => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "qsbw-handoff-"))
+  const file = path.join(runtime, "qs-bitwarden-cli", "session-handoff")
+  fs.mkdirSync(path.dirname(file))
+  execFileSync("mkfifo", ["-m", "600", file])
+  const started = Date.now()
+  let out = ""
+  const child = spawn("bash", ["-c", expecting], { env: { ...process.env, XDG_RUNTIME_DIR: runtime } })
+  child.stdout.on("data", chunk => { out += chunk })
+  child.on("close", () => {
+    check("a pipe with no writer yields nothing within its timeout",
+      out === "" && Date.now() - started < 9000 && !fs.existsSync(file),
+      `${JSON.stringify(out)} after ${Date.now() - started}ms`)
+    fs.rmSync(runtime, { recursive: true, force: true })
+    resolve()
+  })
+})
 
 // -------------------------------------------------------------------------
 // Both settings reach the settings screen
@@ -356,4 +381,4 @@ for (const k of ["lockOnScreenLock", "lockOnSuspend"]) {
 
 // -------------------------------------------------------------------------
 
-suspendChecks.then(done, error => { console.error(error); process.exit(1) })
+Promise.all([suspendChecks, noWriterCheck]).then(done, error => { console.error(error); process.exit(1) })

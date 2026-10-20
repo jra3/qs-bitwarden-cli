@@ -453,3 +453,70 @@ fn runs_do_not_outlive_a_crashed_helper() {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+#[test]
+fn a_forget_ends_the_copies_still_serving_the_clipboard() {
+    let mut helper = Helper::start();
+    // A wl-copy that keeps serving, as the real one does under `timeout`
+    // until its clear: it records its pid and whether it was told to stop.
+    // Bounded, so a failure here cannot leave it behind.
+    let dir = helper.dir.clone();
+    std::fs::write(
+        dir.join("wl-copy"),
+        format!(
+            "#!/bin/sh\ncat > {d}/clipboard\necho \"$*\" > {d}/clipboard-args\necho $$ > {d}/clipboard-pid\n\
+             trap 'echo ended > {d}/ended; exit 0' TERM\n\
+             n=0; while [ $n -lt 200 ]; do sleep 0.05; n=$((n+1)); done\n",
+            d = dir.display()
+        ),
+    )
+    .unwrap();
+    let script = format!("cat <<'EOF'\n{}\nEOF", vault_read());
+    helper.exec(1, &script, json!({ "capture": "vault" }));
+    for (q, clear) in [(10, 30), (11, 0)] {
+        let copy = helper.query(
+            q,
+            json!({ "type": "copyPassword", "id": "a", "clearSec": clear }),
+        );
+        assert_eq!(copy["ok"], true);
+        let pid_file = dir.join("clipboard-pid");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pid_file.exists() {
+            assert!(Instant::now() < deadline, "the copy never started");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let args = std::fs::read_to_string(dir.join("clipboard-args")).unwrap_or_default();
+        // The no-expiry form is still a foreground child, so it can be ended.
+        assert_eq!(args.trim(), "--foreground --sensitive", "clearSec {clear}");
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "the copy should still be serving before the forget"
+        );
+
+        helper.send(json!({ "type": "forget", "v": 1 }));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !dir.join("ended").exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the copy outlived the forget (clearSec {clear})"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // A copy after the forget has nothing to copy.
+        let after = helper.query(
+            q + 50,
+            json!({ "type": "copyPassword", "id": "a", "clearSec": clear }),
+        );
+        assert_eq!(after["ok"], false);
+        for name in ["clipboard-pid", "ended", "clipboard"] {
+            let _ = std::fs::remove_file(dir.join(name));
+        }
+        helper.exec(q + 60, &script, json!({ "capture": "vault" }));
+    }
+}

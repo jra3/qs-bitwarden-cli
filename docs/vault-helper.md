@@ -32,8 +32,15 @@ dump taken after you revealed something can still contain it.
 
 A password or other secret you copy goes from the helper straight to
 `wl-copy` (with the same timed clear and "sensitive" marking); it never passes
-through the shell. TOTP codes are computed in the helper, and only the code
-reaches the shell, not the key. Search runs in the helper too, so it still
+through the shell. The helper keeps a list of the copies it has serving, and
+a lock, logout or account switch ends them along with everything else it
+holds, so a copy that started just before the lock does not stay on the
+clipboard until its own timer runs out. The timer itself is the copy's
+(`timeout` around `wl-copy`), so a copy still clears on schedule if the
+helper or the shell dies first. Values the shell copies itself (TOTP codes,
+usernames, generated passwords, Send links) are not on that list; the lock
+clears them only if they are still the current selection. TOTP codes are
+computed in the helper, and only the code reaches the shell, not the key. Search runs in the helper too, so it still
 finds text in notes the shell does not have, and it stays fast on a large
 vault. Notes of an item that asks for the master password are not searched.
 
@@ -42,8 +49,8 @@ revealed, copied or edited, and its TOTP code is fetched only when you reveal
 or copy it.
 
 Locking, logging out and switching accounts tell the helper to forget
-everything. A lock that is still running `bw lock` keeps its own copy of the
-key until it finishes.
+everything, copies on the clipboard included. A lock that is still running
+`bw lock` keeps its own copy of the key until it finishes.
 
 ## How the shell talks to it
 

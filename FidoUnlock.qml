@@ -405,25 +405,33 @@ Item {
   }
 
   // The typed master password is checked against the stored one; one touch
-  // adds this key's wrap. Nothing typed is stored.
-  function submitSetup() {
-    if (busy || !vault) return
+  // adds this key's wrap. Nothing typed is stored. `master`, when given, is
+  // a reference to what pinentry took (Model.heldSecretRef(), from the
+  // vault's submitFidoSetup()) and is forgotten here however this ends; else
+  // the form's field is used.
+  function submitSetup(master) {
+    var typed = String(master || setupMaster || "")
+    setupMaster = ""
+    var refuse = function(text) {
+      error = text
+      if (vault) vault.forgetHeldPassword(typed)
+      typed = ""
+    }
+    if (busy || !vault) { refuse(error); return }
     if (!vault.quickUnlockAvailable) {
-      error = vault.quickUnlockUnavailableReason
+      refuse(vault.quickUnlockUnavailableReason)
       return
     }
-    if (!setupMaster) {
-      error = "Confirm your master password to enable FIDO2 unlock"
+    if (!typed) {
+      refuse("Confirm your master password to enable FIDO2 unlock")
       return
     }
     var usable = probe.usable || []
     if (usable.length === 0 || !probe.rp) {
-      error = unavailableReason()
+      refuse(unavailableReason())
       return
     }
     var target = { device: usable[0].device, cred: usable[0].cred, rp: probe.rp }
-    var typed = setupMaster
-    setupMaster = ""
     error = ""
     busy = true
     setupActive = true
@@ -433,6 +441,7 @@ Item {
     vault.addQuickUnlockMethodWith(typed, function(tool, account) {
       return Model.fidoEnrollCommand(tool, account, target)
     }, null, function(ok, why, code) {
+      vault.forgetHeldPassword(typed)
       typed = ""
       busy = false
       message = ""

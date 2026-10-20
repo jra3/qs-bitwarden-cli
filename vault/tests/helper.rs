@@ -261,6 +261,54 @@ fn a_pinentry_answer_is_decoded_and_injected_by_name() {
 }
 
 #[test]
+fn a_pinentry_answer_feeds_the_password_writer_and_bw_login_by_name() {
+    // The login's master password: pinentry's answer is held, then injected
+    // into the FIFO writer (here, a file) and `bw login` as BW_PASSWORD. The
+    // panel sees neither the answer nor the written value, and once the
+    // attempt forgets the name nothing is injected.
+    let mut helper = Helper::start();
+    let kept = helper.exec(
+        1,
+        "printf '%s\\n' 'hunter%252'",
+        json!({ "capture": "pinentry:login" }),
+    );
+    assert_eq!(
+        (kept["out"].as_str(), kept["held"].as_bool()),
+        (Some(""), Some(true))
+    );
+    let fifo = helper.dir.join("login-password");
+    let write = format!("printf '%s' \"$BW_PASSWORD\" > '{}'", fifo.display());
+    let written = helper.exec(
+        2,
+        &write,
+        json!({ "inject": { "BW_PASSWORD": "secret:login" } }),
+    );
+    assert_eq!(
+        (written["code"].as_i64(), written["out"].as_str()),
+        (Some(0), Some(""))
+    );
+    assert_eq!(std::fs::read_to_string(&fifo).unwrap(), "hunter%2");
+    // The same name serves a second run of the attempt (a two-step retry),
+    // and a run that keeps a session from it hands the panel no password.
+    let login = helper.exec(
+        3,
+        &format!("test \"$BW_PASSWORD\" = 'hunter%2' && printf '%s\\n' '{TOKEN}'"),
+        json!({ "inject": { "BW_PASSWORD": "secret:login" }, "capture": "session" }),
+    );
+    assert_eq!(login["code"], 0);
+    assert_eq!(login["session"], true);
+    assert!(!login["out"].as_str().unwrap().contains("hunter"));
+    helper.send(json!({ "type": "forgetSecret", "v": 1, "name": "login" }));
+    let gone = helper.exec(
+        4,
+        &write,
+        json!({ "inject": { "BW_PASSWORD": "secret:login" } }),
+    );
+    assert_eq!(gone["code"], 0);
+    assert_eq!(std::fs::read_to_string(&fifo).unwrap(), "");
+}
+
+#[test]
 fn a_vault_read_reaches_the_panel_without_secrets() {
     let mut helper = Helper::start();
     let script = format!("cat <<'EOF'\n{}\nEOF", vault_read());

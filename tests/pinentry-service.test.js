@@ -16,7 +16,11 @@ const { check, eq, done } = createSuite("pinentry-service")
 const names = ["requestPinentry", "onPinentryExited", "beginPinentry", "endPinentry", "cancelPinentry",
   "resumeFromPinentry", "unlockWithPinentry", "unlockPinWithPinentry", "retryPinentryPin", "releaseHeldPin",
   "submitRepromptWithPinentry", "submitReprompt", "forgetHeldPassword", "forgetHeldAfter", "onUnlockOutput",
-  "declinePinentry", "resetPinentryChoice"]
+  "declinePinentry", "resetPinentryChoice",
+  // The login and the quick-unlock setup forms.
+  "loginSecret", "forgetLoginMaster", "submitLoginWithPinentry", "submitLogin", "clearLoginAttempt",
+  "requestSetupSecrets", "submitPinSetup", "savePinSetup", "submitFingerprintSetup", "saveFingerprintSetup",
+  "submitFidoSetup"]
 
 function makeVault(extra) {
   const v = {
@@ -27,6 +31,7 @@ function makeVault(extra) {
     get typedSecretEntry() { return Model.typedSecretEntry({ usePinentry: this.usePinentry,
       missing: this.pinentryMissing, declined: this.pinentryDeclined, helperState: this.vaultHelperState }) },
     get pinentryAvailable() { return this.typedSecretEntry === "pinentry" },
+    get typedSecretWaits() { return this.typedSecretEntry === "wait" },
     pinentryProgramName: "pinentry", userEmail: "me@example.com",
     pinentryActive: false, pinentryRun: null, pinentryView: null, pinentryWasOpen: false, pinentryReturning: false,
     pinentryMasterName: "", pinentryNotice: "", heldPinName: "",
@@ -354,10 +359,216 @@ function finish(v, code, held, stderr) {
     w.repromptBusy === false && /stopped before answering/.test(w.repromptError) && w.pinentryAvailable, w.repromptError)
 }
 
+// --- the login's master password --------------------------------------------------------------------
+
+// The login as the service runs it, with its processes and its other screens
+// stood in for: what reaches the FIFO writer and the API-key login's
+// environment is what is checked.
+function makeLoginVault(extra) {
+  const v = makeVault(Object.assign({
+    loginMethod: "email", loginEmail: "me@example.com", loginMasterName: "", loginPassword: "",
+    loginClientId: "", loginClientSecret: "", login2faCode: "", login2faMethod: -1, loginAttemptMethod: -1,
+    loginSubmitted: false, isLoading: false, logoutPending: false, show2faField: false, show2faMethodPicker: false,
+    showDeviceCodeField: false, loginDeviceVerification: false, loginAttemptHadCode: false, login2faMethodConfirmed: false,
+    loginDeviceCode: "", deviceVerificationAttempt: false, deviceVerificationPending: false, secondFactorStartedAt: 0,
+    loginPasswordRetryUsed: false, rememberedTwoFactorMethod: -1, loginPrewarmSignature: "",
+    loginPrepareAfterPrewarmStop: false, loginSubmitAfterPrewarmStop: false,
+    loginProc: { running: false, command: null }, writes: [], prewarms: 0,
+    resolvedLoginServerUrl() { return "" },
+    emailLoginSignature() { return "sig" },
+    prepareEmailLogin() { this.prewarms += 1 },
+    writeAuthPassword(channel, password) { this.writes.push([channel, password]) }
+  }, extra || {}))
+  // The view is the presenter; the login focuses fields on it.
+  v.view.focusField = function() {}
+  Object.defineProperty(v.proc, "running", {
+    configurable: true, get() { return this._r === true },
+    set(value) { if (value) this.starts.push({ command: this.command, environment: this.environment, capture: this.capture }); this._r = value }
+  })
+  return v
+}
+
+{
+  const v = makeLoginVault()
+  v.submitLogin()
+  const run = v.proc.starts[0]
+  check("a login with no password typed asks pinentry for it, naming the account",
+    run && /^pinentry:pw\d+$/.test(run.capture) && /log in/i.test(run.environment.QSBW_PE_DESC) && /me@example\.com/.test(run.environment.QSBW_PE_DESC)
+      && run.command[6] === "Master password:", JSON.stringify(run))
+  check("bw is started first, to be waiting on the FIFO", v.prewarms === 1 && !v.opened && v.writes.length === 0, "")
+  const name = run.capture.slice("pinentry:".length)
+  finish(v, 0, true)
+  check("the answer's name is kept for the attempt and the login is submitted with it",
+    v.loginMasterName === name && v.loginSubmitted && v.writes.length === 1 && v.writes[0][0] === "login"
+      && v.writes[0][1] === Model.heldSecretRef(name) && v.loginProc.command && /bw login/.test(v.loginProc.command.join(" ")),
+    JSON.stringify(v.writes))
+  check("nothing typed is in the shell's field, and the panel is back", v.loginPassword === "" && v.opened, "")
+  // A two-step challenge: the same held password goes again, without asking.
+  v.loginSubmitted = false
+  v.loginProc.running = true
+  v.loginPrewarmSignature = "sig"
+  v.show2faField = true
+  v.login2faCode = "123456"
+  v.submitLogin()
+  check("a second stage sends the same held name and does not ask again",
+    v.proc.starts.length === 1 && v.writes.length === 2 && v.writes[1][1] === Model.heldSecretRef(name) && !v.forgotten.includes(name),
+    JSON.stringify(v.writes))
+  v.clearLoginAttempt()
+  check("the end of the attempt forgets it", v.forgotten.includes(name) && v.loginMasterName === "" && v.loginSecret() === "", v.forgotten.join())
+
+  const w = makeLoginVault()
+  w.submitLogin()
+  finish(w, Model.pinentryExitCodes().cancelled, false)
+  check("a cancel submits nothing and keeps no name",
+    w.writes.length === 0 && w.loginMasterName === "" && !w.loginSubmitted && w.errorMessage === "" && w.opened, w.errorMessage)
+  w.submitLogin()
+  finish(w, Model.pinentryExitCodes().empty, false)
+  eq("an empty answer asks for a password", w.errorMessage, "Master password is required")
+
+  const x = makeLoginVault({ loginMethod: "apikey", loginClientId: "user.1", loginClientSecret: "s" })
+  x.submitLogin()
+  check("the API-key login asks pinentry too", x.proc.starts.length === 1, "")
+  const apiName = x.proc.starts[0].capture.slice("pinentry:".length)
+  finish(x, 0, true)
+  check("and its environment carries the held name through loginSecret()",
+    x.loginSubmitted && x.loginSecret() === Model.heldSecretRef(apiName) && x.loginProc.command && /bw login --apikey/.test(x.loginProc.command.join(" ")),
+    String(x.loginProc.command))
+
+  const y = makeLoginVault({ vaultHelperActive: false })
+  y.submitLogin()
+  check("without the helper the login waits for it rather than offer the field",
+    y.proc.starts.length === 0 && /vault helper/.test(y.errorMessage) && y.typedSecretWaits, y.errorMessage)
+
+  const z = makeLoginVault({ usePinentry: false })
+  z.submitLogin()
+  eq("with pinentry off the field is asked for", z.errorMessage, "Master password is required")
+  z.loginPassword = "hunter2"
+  z.submitLogin()
+  check("and what it holds goes to the writer as before, with no pinentry run",
+    z.proc.starts.length === 0 && z.writes.length === 1 && z.writes[0][1] === "hunter2", JSON.stringify(z.writes))
+}
+
+// --- the quick-unlock setup forms ----------------------------------------------------------------
+
+function makeSetupVault(extra) {
+  const v = makeVault(Object.assign({
+    quickUnlockAvailable: true, quickUnlockUnavailableReason: "no tool", currentScreen: "pin", settings: {}, adds: [],
+    pinSetupPin: "", pinSetupConfirm: "", pinSetupMaster: "", pinError: "", pinAttempts: 3, legacyPinStored: true,
+    fpBusy: false, fpSetupActive: false, fpError: "", fpSetupMaster: "", legacyFingerprintStored: true,
+    fidoBusy: false, fidoUnlocker: { error: "", setups: [], submitSetup(master) { this.setups.push(master) } },
+    addQuickUnlockMethod(pw, op, extraEnv, done) { this.adds.push({ pw, op, extraEnv, done }) },
+    beginEpochOperation() {}, epochOperationIsStale() { return false }, removeQuickUnlockMethod() {},
+    noteQuickUnlockEnabled() {}, requestPinCredentialClear() {}, recomputePinConfigured() {},
+    requestMasterCredentialClear() {}, recomputeFingerprintStored() {},
+    writeSetting(name, value) { this.settings[name] = value }, flashNotification() {},
+    quickUnlockErrorText(why, fallback) { return why === "wrong-password" ? "That is not your master password." : fallback }
+  }, extra || {}))
+  Object.defineProperty(v.proc, "running", {
+    configurable: true, get() { return this._r === true },
+    set(value) { if (value) this.starts.push({ command: this.command, environment: this.environment, capture: this.capture }); this._r = value }
+  })
+  return v
+}
+const nameOf = run => run.capture.slice("pinentry:".length)
+
+{
+  const v = makeSetupVault()
+  v.submitPinSetup()
+  check("PIN setup asks pinentry for the master password first",
+    v.proc.starts.length === 1 && /confirm.*master password/i.test(v.proc.starts[0].environment.QSBW_PE_DESC) && v.proc.starts[0].command[6] === "Master password:"
+      && !v.opened, JSON.stringify(v.proc.starts[0] && v.proc.starts[0].command.slice(5)))
+  const master = nameOf(v.proc.starts[0])
+  finish(v, 0, true)
+  const pinRun = v.proc.starts[1]
+  check("then for the new PIN, twice in one window, digits only, at the setup floor, with the panel still hidden",
+    pinRun && /PIN/.test(pinRun.environment.QSBW_PE_DESC) && pinRun.command[6] === "New PIN:" && pinRun.command[7] === String(Model.pinMinLength())
+      && pinRun.command[8] === Model.pinentryRepeatPrompt() && pinRun.command[9] === "1" && !v.opened && v.adds.length === 0,
+    JSON.stringify(pinRun && pinRun.command.slice(5)))
+  finish(v, Model.pinentryExitCodes().short, false)
+  check("a short PIN is asked for again with the reason, the master password still held",
+    v.proc.starts.length === 3 && v.proc.starts[2].environment.QSBW_PE_ERR === "PIN must be at least " + Model.pinMinLength() + " digits"
+      && !v.forgotten.includes(master), JSON.stringify(v.proc.starts[2] && v.proc.starts[2].environment.QSBW_PE_ERR))
+  finish(v, Model.pinentryExitCodes().digits, false)
+  check("so is one that is not all digits",
+    v.proc.starts.length === 4 && v.proc.starts[3].environment.QSBW_PE_ERR === "PIN must contain only digits", "")
+  const pin = nameOf(v.proc.starts[3])
+  finish(v, 0, true)
+  check("both reach the envelope write by name, and nothing is in the form's fields",
+    v.adds.length === 1 && v.adds[0].pw === Model.heldSecretRef(master) && v.adds[0].op.kind === "add-pin"
+      && v.adds[0].extraEnv[Model.pinEnvVar()] === Model.heldSecretRef(pin) && v.pinBusy && v.opened
+      && v.pinSetupMaster === "" && v.pinSetupPin === "" && v.pinSetupConfirm === "", JSON.stringify(v.adds[0] && v.adds[0].pw))
+  v.adds[0].done(true, "")
+  check("the write's end forgets both, and the method is on",
+    v.forgotten.includes(master) && v.forgotten.includes(pin) && !v.pinBusy && v.settings.pinUnlock === true && v.currentScreen === "settings",
+    v.forgotten.join())
+
+  const w = makeSetupVault()
+  w.submitPinSetup()
+  const wMaster = nameOf(w.proc.starts[0])
+  finish(w, 0, true)
+  finish(w, Model.pinentryExitCodes().norepeat, false)
+  check("a pinentry that cannot take the PIN twice keeps nothing, forgets the master password and offers the fields",
+    w.adds.length === 0 && w.forgotten.includes(wMaster) && w.pinentryNotice === Model.pinentryNoRepeatNotice() && w.pinentryAvailable && w.opened,
+    w.pinentryNotice)
+  w.declinePinentry()
+  w.pinSetupMaster = "hunter2"; w.pinSetupPin = "123456"; w.pinSetupConfirm = "123456"
+  w.submitPinSetup()
+  check("picked, the fields are used as before and no pinentry runs",
+    w.proc.starts.length === 2 && w.adds.length === 1 && w.adds[0].pw === "hunter2" && w.adds[0].extraEnv[Model.pinEnvVar()] === "123456"
+      && w.pinSetupMaster === "", JSON.stringify(w.adds[0] && w.adds[0].pw))
+
+  const x = makeSetupVault()
+  x.submitPinSetup()
+  const xMaster = nameOf(x.proc.starts[0])
+  finish(x, 0, true)
+  finish(x, Model.pinentryExitCodes().cancelled, false)
+  check("cancelling at the PIN forgets the master password and writes nothing",
+    x.adds.length === 0 && x.forgotten.includes(xMaster) && x.pinError === "" && x.opened, "")
+  x.submitPinSetup()
+  const xm = nameOf(x.proc.starts[2])
+  finish(x, 0, true)
+  const xp = nameOf(x.proc.starts[3])
+  finish(x, 0, true)
+  x.adds[0].done(false, "wrong-password")
+  check("a wrong master password is named, and both names are forgotten",
+    x.pinError === "That is not your master password." && x.forgotten.includes(xm) && x.forgotten.includes(xp) && !x.pinBusy, x.pinError)
+
+  const y = makeSetupVault({ vaultHelperActive: false })
+  y.submitPinSetup()
+  check("without the helper the form waits for it", y.proc.starts.length === 0 && /vault helper/.test(y.pinError) && y.adds.length === 0, y.pinError)
+}
+
+{
+  const v = makeSetupVault({ currentScreen: "fingerprint" })
+  v.submitFingerprintSetup()
+  check("fingerprint setup asks pinentry for the master password",
+    v.proc.starts.length === 1 && /confirm.*master password/i.test(v.proc.starts[0].environment.QSBW_PE_DESC), "")
+  const master = nameOf(v.proc.starts[0])
+  finish(v, 0, true)
+  check("and adds the wrap with it by name, nothing in the field",
+    v.proc.starts.length === 1 && v.adds.length === 1 && v.adds[0].pw === Model.heldSecretRef(master) && v.adds[0].op.kind === "add-fingerprint"
+      && v.adds[0].extraEnv === null && v.fpBusy && v.fpSetupMaster === "", JSON.stringify(v.adds[0] && v.adds[0].op))
+  v.adds[0].done(true, "")
+  check("the write's end forgets it", v.forgotten.includes(master) && !v.fpBusy && v.settings.fingerprintUnlock === true, v.forgotten.join())
+
+  const w = makeSetupVault({ currentScreen: "fido" })
+  w.submitFidoSetup()
+  check("FIDO2 setup asks pinentry for the master password", w.proc.starts.length === 1 && /master password/i.test(w.proc.starts[0].environment.QSBW_PE_DESC), "")
+  const wMaster = nameOf(w.proc.starts[0])
+  finish(w, 0, true)
+  eq("and hands the unlocker the name, not a value", w.fidoUnlocker.setups.join(), Model.heldSecretRef(wMaster))
+  const x = makeSetupVault({ usePinentry: false, currentScreen: "fido" })
+  x.submitFidoSetup()
+  check("with pinentry off the unlocker takes its own field", x.proc.starts.length === 0 && x.fidoUnlocker.setups.length === 1 && x.fidoUnlocker.setups[0] === "", "")
+  const y = makeSetupVault({ vaultHelperActive: false, currentScreen: "fido" })
+  y.submitFidoSetup()
+  check("without the helper it waits", y.fidoUnlocker.setups.length === 0 && /vault helper/.test(y.fidoUnlocker.error), y.fidoUnlocker.error)
+}
+
 // --- the wiring ------------------------------------------------------------------------------------
 
-const flows = ["unlockWithPinentry", "unlockPinWithPinentry", "submitRepromptWithPinentry", "requestPinentry", "onPinentryExited"]
-  .map(body).join("\n")
+const flows = ["unlockWithPinentry", "unlockPinWithPinentry", "submitRepromptWithPinentry", "requestPinentry", "onPinentryExited",
+  "submitLoginWithPinentry", "requestSetupSecrets"].map(body).join("\n")
 check("no pinentry flow writes what was typed into the shell's fields",
   !/\b(masterPassword|pinEntry|loginPassword|pinSetupMaster|fpSetupMaster)\s*=[^=]/.test(flows), flows)
 check("the run asks the helper to hold the answer",

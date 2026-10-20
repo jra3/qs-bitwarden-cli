@@ -301,4 +301,19 @@ check("a cancelled unlock scrubs any token that won the exit race",
   /!root\.unlockSubmitted[\s\S]{0,120}clearProcessCollectorSoon\(unlockProc\)/.test(unlockProcBlock),
   unlockProcBlock)
 
+// The writer names the variable and runs under the vault helper, so a
+// password pinentry took reaches the FIFO without the shell holding it: the
+// vault turns a held reference in the writer's environment into an inject
+// the helper resolves.
+{
+  const writerSrc = Model.authPasswordWriteCommand("login")[2]
+  check("the writer reads the password from its own environment, by variable name only",
+    writerSrc.includes("\"$" + Model.passwordEnvVar() + "\"") && !/\$\{?BW_PASSWORD[^}\s"]/.test(writerSrc.replace(/"\$BW_PASSWORD"|"\$\{BW_PASSWORD:-\}"/g, "")),
+    writerSrc)
+  check("the writer is a VaultProcess, so it runs under the helper when the helper is up",
+    /VaultProcess \{\s*id: authPasswordWriterProc\s*vault: root/.test(panelSrc), "")
+  check("a held reference in its environment becomes a helper inject, never a value",
+    /Model\.heldSecretName\(proc\.environment\[key\]\)[\s\S]{0,80}inject\[key\] = "secret:" \+ held/.test(panelSrc), "")
+}
+
 done()

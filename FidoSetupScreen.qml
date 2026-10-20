@@ -106,8 +106,18 @@ Column {
       font.bold: true
     }
 
+    // Typed into pinentry when it is available (submitFidoSetup() in
+    // Service.qml): the field is drawn only when the vault says so.
+    PinentryHint {
+      panel: screen.panel
+      vault: screen.vault
+      what: "master password"
+      busy: screen.vault.fidoBusy
+    }
+
     LineField {
       id: masterField
+      visible: vault.typedSecretEntry === "field"
       width: parent.width
       placeholderText: "Needed once, to store for FIDO2 unlock..."
       password: true
@@ -134,13 +144,13 @@ Column {
       spacing: Style.space(8)
 
       Button {
-        text: vault.fidoBusy ? "Saving..." : "Enable"
-        iconText: vault.fidoBusy ? "󰑐" : "󰟵"
-        iconSpinning: vault.fidoBusy
+        text: vault.fidoBusy ? "Saving..." : (vault.typedSecretWaits ? "Waiting for the vault helper..." : "Enable")
+        iconText: vault.fidoBusy || vault.typedSecretWaits ? "󰑐" : "󰟵"
+        iconSpinning: vault.fidoBusy || vault.typedSecretWaits
         selected: true
         accent: Color.accent
         fontFamily: panel.fontFamily
-        enabled: !vault.fidoBusy
+        enabled: !vault.fidoBusy && !vault.typedSecretWaits
         onClicked: vault.submitFidoSetup()
       }
 

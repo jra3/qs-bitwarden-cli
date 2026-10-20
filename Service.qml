@@ -3742,7 +3742,7 @@ Item {
       Qt.callLater(function() { presenter.focusField("deviceCode") })
       return
     }
-    if (!String(loginPassword || "")) {
+    if (!loginSecret()) {
       errorMessage = "Your master password is needed again for this step."
       resetEmailLoginSecondFactor()
       Qt.callLater(function() { presenter.focusField("loginPass") })
@@ -3772,15 +3772,15 @@ Item {
       String(loginEmail || "").trim(), resolvedLoginServerUrl(), login2faMethod)
     loginProc.running = true
     loginSubmitted = true
-    writeAuthPassword("login", loginPassword)
+    writeAuthPassword("login", loginSecret())
   }
 
   // A login waiting on an emailed challenge survives a close, within its
-  // window and while the password is still held.
+  // window and while the password is still held (typed, or by the helper).
   function pendingSecondFactorLogin() {
     if (status !== "unauthenticated" || loginMethod !== "email") return false
     if (!show2faField && !showDeviceCodeField && !show2faMethodPicker) return false
-    if (!String(loginPassword || "")) return false
+    if (!loginSecret()) return false
     return Model.secondFactorWindowOpen(secondFactorStartedAt, Date.now())
   }
 
@@ -3832,6 +3832,7 @@ Item {
     if (logoutCleanupFailed) return "Retry Logout Cleanup"
     if (logoutPending) return "Finishing logout..."
     if (isLoading) return show2faField ? "Verifying..." : "Logging in..."
+    if (typedSecretWaits && !loginSecret()) return "Waiting for the vault helper..."
     return show2faField ? "Verify & Unlock" : "Log In & Unlock"
   }
 
@@ -3885,6 +3886,7 @@ Item {
 
   // Login credentials and challenge state, back to the first stage.
   function clearLoginAttempt() {
+    forgetLoginMaster()
     loginPassword = ""
     loginClientId = ""
     loginClientSecret = ""
@@ -3983,13 +3985,17 @@ Item {
 
     if (loginMethod === "email") {
       var email = String(loginEmail || "").trim()
-      var pass = String(loginPassword === undefined || loginPassword === null ? "" : loginPassword)
+      var pass = loginSecret()
       if (!email) {
         errorMessage = "Email address is required"
         return
       }
       if (!pass) {
-        errorMessage = "Master password is required"
+        if (pinentryAvailable) {
+          submitLoginWithPinentry()
+          return
+        }
+        errorMessage = typedSecretWaits ? "Waiting for the vault helper. Try again in a moment." : "Master password is required"
         return
       }
       if (show2faMethodPicker) {
@@ -4024,7 +4030,7 @@ Item {
     } else {
       var id = String(loginClientId || "").trim()
       var secret = String(loginClientSecret || "").trim()
-      var pass2 = String(loginPassword === undefined || loginPassword === null ? "" : loginPassword)
+      var pass2 = loginSecret()
 
       if (!id) {
         errorMessage = "API Client ID is required"
@@ -4035,7 +4041,11 @@ Item {
         return
       }
       if (!pass2) {
-        errorMessage = "Master password is required to unlock vault"
+        if (pinentryAvailable) {
+          submitLoginWithPinentry()
+          return
+        }
+        errorMessage = typedSecretWaits ? "Waiting for the vault helper. Try again in a moment." : "Master password is required to unlock vault"
         return
       }
 
@@ -4079,6 +4089,7 @@ Item {
       // terminal can give.
       if (exitCode === 124 || Model.loginPromptRanOutOfInput(out, err)) {
         showDeviceCodeField = false
+        forgetLoginMaster()
         logLogin("device-unanswerable", out, err, exitCode)
         errorMessage = "This login asked for something the panel could not answer. "
           + "Finish it in a terminal instead."
@@ -4104,6 +4115,7 @@ Item {
       authPasswordWriteValue = ""
       if (authPasswordWriterProc.running) authPasswordWriterProc.running = false
       login2faCode = ""
+      forgetLoginMaster()
       syncLoginFieldsToState()
       logLogin("code-channel-missing", out, err, exitCode)
       errorMessage = "This Bitwarden CLI cannot take the two-step code privately "
@@ -4128,6 +4140,7 @@ Item {
     // The account's two-step methods are all ones the CLI cannot do.
     if (Model.loginHasNoUsableProvider(out, err)) {
       resetEmailLoginSecondFactor()
+      forgetLoginMaster()
       logLogin("no-usable-provider", out, err, exitCode)
       errorMessage = "This account's two-step method is one the Bitwarden CLI cannot use, "
         + "such as a passkey or Duo. Log in with an API key instead."
@@ -4192,9 +4205,12 @@ Item {
     if (exitCode === 0 && out.length > 10) {
       rememberTwoFactorMethod(login2faMethod)
       // Typed and accepted by `bw`: the stored password for a fresh login
-      // (storeAcceptedMasterPassword()).
-      pendingUnlockPassword = String(loginPassword || "")
+      // (storeAcceptedMasterPassword()). One pinentry took is the helper's
+      // under loginMasterName; the reference passes to the unlock, which
+      // forgets it once the stored copy is dealt with.
+      pendingUnlockPassword = loginSecret()
       pendingUnlockFrom = ""
+      loginMasterName = ""
       loginPassword = ""
       login2faCode = ""
       logLogin("success", out, err, exitCode)
@@ -4202,6 +4218,9 @@ Item {
       return
     }
 
+    // Refused, or nothing came of it: a password pinentry took is forgotten,
+    // and the next attempt asks for it again (as a refused unlock does).
+    forgetLoginMaster()
     if (err) {
       logLogin("bw-error", out, err, exitCode)
       errorMessage = Model.sanitizeInteractiveStderr(err, "") || "Login failed. Please check your credentials."
@@ -4509,7 +4528,7 @@ Item {
     if (loginMethod === "apikey") {
       // A live Process binding: only carry the API fields once a login starts.
       if (!loginSubmitted) return authEnv("", "", "", "")
-      return authEnv(loginPassword,
+      return authEnv(loginSecret(),
                      String(loginClientId || "").trim(),
                      String(loginClientSecret || "").trim(),
                      String(login2faCode || "").trim())
@@ -4984,25 +5003,44 @@ Item {
   }
 
   // The typed master password must open the envelope; a PIN wrap (Argon2id of
-  // the PIN) is added. Nothing typed is stored.
+  // the PIN) is added. Nothing typed is stored. With pinentry, both are typed
+  // there (requestSetupSecrets()) and the fields are not used.
   function submitPinSetup() {
     if (pinBusy) return
+    if (!quickUnlockAvailable) { pinError = quickUnlockUnavailableReason; return }
+    if (pinentryAvailable) {
+      pinError = ""
+      requestSetupSecrets(true, function(secrets) {
+        if (secrets) root.savePinSetup(secrets.master, secrets.pin)
+      })
+      return
+    }
+    if (typedSecretWaits) { pinError = "Waiting for the vault helper. Try again in a moment."; return }
     var err = Model.validatePin(pinSetupPin, pinSetupConfirm)
     if (err) { pinError = err; return }
-    if (!quickUnlockAvailable) { pinError = quickUnlockUnavailableReason; return }
     if (!pinSetupMaster) { pinError = "Confirm your master password to set a PIN"; return }
+    var typed = pinSetupMaster
+    pinSetupMaster = ""
+    savePinSetup(typed, pinSetupPin)
+  }
 
+  // `master` and `pin` are typed, or references to what pinentry took, which
+  // the helper fills in for the envelope tool; a reference is forgotten when
+  // the write ends.
+  function savePinSetup(master, pin) {
     pinError = ""
     pinUnlockError = ""
     pinBusy = true
-    var typed = pinSetupMaster
-    var pin = {}
-    pin[Model.pinEnvVar()] = pinSetupPin
-    pinSetupMaster = ""
+    var typed = master
+    var pinEnv = {}
+    pinEnv[Model.pinEnvVar()] = pin
     beginEpochOperation("pinAdd")
-    addQuickUnlockMethod(typed, { kind: "add-pin" }, pin, function(ok, why) {
+    addQuickUnlockMethod(typed, { kind: "add-pin" }, pinEnv, function(ok, why) {
+      root.forgetHeldPassword(typed)
+      root.forgetHeldPassword(pin)
       typed = ""
-      pin = null
+      pin = ""
+      pinEnv = null
       root.pinBusy = false
       // Stale by the time it landed: remove the unwanted wrap.
       if (root.epochOperationIsStale("pinAdd") || root.currentScreen !== "pin") {
@@ -5631,24 +5669,44 @@ Item {
   }
 
   // The typed master password must open the envelope; a fingerprint wrap is
-  // added. Nothing typed is stored.
+  // added. Nothing typed is stored. With pinentry it is typed there
+  // (requestSetupSecrets()) and the field is not used.
   function submitFingerprintSetup() {
     if (fpBusy) return
     if (!quickUnlockAvailable) {
       fpError = quickUnlockUnavailableReason
       return
     }
+    if (pinentryAvailable) {
+      fpError = ""
+      requestSetupSecrets(false, function(secrets) {
+        if (secrets) root.saveFingerprintSetup(secrets.master)
+      })
+      return
+    }
+    if (typedSecretWaits) {
+      fpError = "Waiting for the vault helper. Try again in a moment."
+      return
+    }
     if (!fpSetupMaster) {
       fpError = "Confirm your master password to enable fingerprint unlock"
       return
     }
+    var typed = fpSetupMaster
+    fpSetupMaster = ""
+    saveFingerprintSetup(typed)
+  }
+
+  // `master` is typed, or a reference to what pinentry took, forgotten when
+  // the write ends.
+  function saveFingerprintSetup(master) {
     fpError = ""
     fpBusy = true
     fpSetupActive = true
-    var typed = fpSetupMaster
-    fpSetupMaster = ""
+    var typed = master
     beginEpochOperation("fingerprintAdd")
     addQuickUnlockMethod(typed, { kind: "add-fingerprint" }, null, function(ok, why) {
+      root.forgetHeldPassword(typed)
       typed = ""
       root.fpBusy = false
       // Stale by the time it landed: remove the unwanted wrap.
@@ -5724,7 +5782,21 @@ Item {
   // Step back from the key without abandoning the request it is holding.
   function releaseFidoUnlock() { fidoUnlocker.releaseSurface() }
   function beginFidoSetup() { fidoUnlocker.beginSetup() }
-  function submitFidoSetup() { fidoUnlocker.submitSetup() }
+  // The master password the form confirms comes from pinentry when it is
+  // available (requestSetupSecrets()), else from the form's field; the
+  // unlocker takes either and forgets a reference when its write ends.
+  function submitFidoSetup() {
+    if (!pinentryAvailable) {
+      if (typedSecretWaits) { fidoUnlocker.error = "Waiting for the vault helper. Try again in a moment."; return }
+      fidoUnlocker.submitSetup("")
+      return
+    }
+    if (fidoBusy) return
+    if (!quickUnlockAvailable) { fidoUnlocker.error = quickUnlockUnavailableReason; return }
+    requestSetupSecrets(false, function(secrets) {
+      if (secrets) fidoUnlocker.submitSetup(secrets.master)
+    })
+  }
   function runFidoSetup() { fidoUnlocker.runOmarchySetup() }
   function forgetFidoUnlock() { fidoUnlocker.forget("") }
 
@@ -5744,18 +5816,20 @@ Item {
   // Typed secrets in pinentry
   // -------------------------------------------------------------------------
   //
-  // The master password (unlock, re-prompt) and the PIN are typed into
-  // `pinentry`, a separate process, not into the panel: a string typed into
-  // the shell stays in its heap after it is cleared and lands in a shell core
-  // dump. The pinentry runs through the vault helper (Model.pinentryCommand()),
-  // which holds what was typed under a name; the shell sees only that name,
-  // and uses it like the password a quick-unlock method produced
-  // (Model.heldSecretRef()). Not available without the helper: while it is
-  // starting, restarting or left stopped the panel waits for it rather than
-  // offer its own field, which is used only where Model.typedSecretEntry()
-  // says (pinentry off, missing or declined, or the vault held in the shell
-  // as allowVaultWithoutHelper allows). Email login and the item forms are
-  // not covered.
+  // The master password (unlock, re-prompt, login, and the one a quick-unlock
+  // setup confirms), the PIN and a new PIN are typed into `pinentry`, a
+  // separate process, not into the panel: a string typed into the shell stays
+  // in its heap after it is cleared and lands in a shell core dump. The
+  // pinentry runs through the vault helper (Model.pinentryCommand()), which
+  // holds what was typed under a name; the shell sees only that name, and
+  // uses it like the password a quick-unlock method produced
+  // (Model.heldSecretRef()): the FIFO writer, `bw login` and the envelope
+  // tool get the value from the helper, in their own environment. Not
+  // available without the helper: while it is starting, restarting or left
+  // stopped the panel waits for it rather than offer its own field, which is
+  // used only where Model.typedSecretEntry() says (pinentry off, missing or
+  // declined, or the vault held in the shell as allowVaultWithoutHelper
+  // allows). The item forms are not covered.
   //
   // Set only by a probe that ran to its end and found no such program
   // (Model.pinentryProbeMissing()): a probe killed or still running leaves
@@ -5775,6 +5849,9 @@ Item {
   readonly property string typedSecretEntry: Model.typedSecretEntry({ usePinentry: usePinentry,
     missing: pinentryMissing, declined: pinentryDeclined, helperState: vaultHelperState })
   readonly property bool pinentryAvailable: typedSecretEntry === "pinentry"
+  // Pinentry will be used, once the helper it runs under is up: the forms
+  // that would take a master password or PIN offer no field meanwhile.
+  readonly property bool typedSecretWaits: typedSecretEntry === "wait"
   // Between the panel hiding for pinentry and pinentry's answer.
   property bool pinentryActive: false
   property var pinentryRun: null
@@ -5824,17 +5901,24 @@ Item {
     pinentryProbeProc.running = true
   }
 
-  // Runs pinentry for `purpose` ("unlock", "pin", "reprompt"), with `error`
-  // shown above the field on a retry. `done({ state, name })`: state is "ok"
-  // (the helper holds the answer as `name`), "cancelled", "empty", "failed" or
-  // "unavailable" (not run). The panel is hidden meanwhile so pinentry can
-  // take the keyboard, and shown again after `done` returns, unless `done`
-  // asked again.
-  function requestPinentry(purpose, error, done) {
+  // Runs pinentry for `purpose` (Model.pinentryDescription(): "unlock",
+  // "pin", "reprompt", "login", "setupMaster", "newPin"), with `error` shown
+  // above the field on a retry. `done({ state, name })`: state is "ok" (the
+  // helper holds the answer as `name`, for a VaultProcess to inject by
+  // Model.heldSecretRef(name)), "cancelled", "empty", "short", "digits",
+  // "norepeat", "failed" or "unavailable" (not run). `opts` (optional):
+  // { minLength, repeat, digits } as Model.pinentryCommand() takes them; a
+  // "pin" purpose has the unlock's floor without them. The panel is hidden
+  // meanwhile so pinentry can take the keyboard, and shown again after `done`
+  // returns, unless `done` asked again. Any flow that needs a typed secret
+  // kept out of the shell (another secret a key or a tool wants) goes
+  // through here with a purpose of its own.
+  function requestPinentry(purpose, error, done, opts) {
     if (!pinentryAvailable || pinentryRun !== null || pinentryProc.running || pinentryProc.runId !== 0) {
       done({ state: "unavailable", name: "" })
       return
     }
+    var o = opts || {}
     var name = newHeldName()
     pinentryRun = { purpose: purpose, name: name, done: done }
     beginPinentry()
@@ -5845,7 +5929,9 @@ Item {
       error: error,
       // The unlock's own floor, as for the field: a shorter PIN is asked for
       // again, not counted as a wrong attempt.
-      minLength: purpose === "pin" ? Model.pinUnlockMinLength() : 0
+      minLength: o.minLength !== undefined ? o.minLength : (purpose === "pin" ? Model.pinUnlockMinLength() : 0),
+      repeat: o.repeat || "",
+      digits: o.digits === true
     }
     pinentryProc.command = Model.pinentryCommand(pinentryProgramName, ask)
     // The description names the account: environment, not argv.
@@ -5870,6 +5956,8 @@ Item {
     else if (exitCode === E.cancelled && String(stderrText || "").trim() === "") state = "cancelled"
     else if (exitCode === E.empty) state = "empty"
     else if (exitCode === E.short) state = "short"
+    else if (exitCode === E.digits) state = "digits"
+    else if (exitCode === E.norepeat) state = "norepeat"
     if (state !== "ok") forgetVaultSecret(run.name)
     // Not remembered (see pinentryDeclined): the user picks the field.
     pinentryNotice = state === "failed" ? Model.pinentryFailedNotice() : ""
@@ -6006,6 +6094,80 @@ Item {
         if (outcome === "wrong") root.submitRepromptWithPinentry("That is not your master password.")
       })
     })
+  }
+
+  // The login's master password (email and API key), typed into pinentry:
+  // the helper holds it under this name for as long as the attempt lasts (a
+  // two-step code, a new-device code, a retry of the FIFO writer all send it
+  // again), and loginPassword stays empty. submitLogin() asks for it; the
+  // name goes with the attempt (clearLoginAttempt()), with a refusal
+  // (onLoginOutput()), or to the stored password once `bw` accepts it.
+  property string loginMasterName: ""
+
+  // What a login sends as its password: the field, or a reference to what
+  // pinentry took (Model.heldSecretRef()), which the helper fills in for the
+  // FIFO writer and the API-key login. Both are passed around as one string
+  // and tested the same way; only the helper can tell them apart.
+  function loginSecret() {
+    if (loginMasterName) return Model.heldSecretRef(loginMasterName)
+    return String(loginPassword === undefined || loginPassword === null ? "" : loginPassword)
+  }
+
+  function forgetLoginMaster() {
+    var name = loginMasterName
+    loginMasterName = ""
+    if (name) forgetVaultSecret(name)
+  }
+
+  // The login as submitted, once pinentry has the master password. `bw`
+  // starts first (prepareEmailLogin()) so it is waiting on the FIFO by the
+  // time the answer is in, as it is when the field takes focus.
+  function submitLoginWithPinentry() {
+    if (pinentryActive) return
+    prepareEmailLogin()
+    requestPinentry("login", "", function(r) {
+      if (r.state === "ok") {
+        root.loginMasterName = r.name
+        root.submitLogin()
+      } else if (r.state === "empty") {
+        root.errorMessage = "Master password is required"
+      }
+    })
+  }
+
+  // The master password a quick-unlock setup form confirms and, for the PIN
+  // form, the new PIN, typed into pinentry: `done({ master, pin })` with
+  // references the helper holds (pin "" when not asked for), or done(null)
+  // for a cancel or a failure, which the notice already describes. The PIN
+  // is typed twice in one window (SETREPEAT) and checked there for its
+  // length and for digits, as the form's fields check it; a pinentry that
+  // cannot take it twice is refused, since nothing confirmed what was typed,
+  // and the notice offers the fields. The caller forgets both references
+  // when its write ends.
+  function requestSetupSecrets(withPin, done) {
+    var askPin = function(masterName, error) {
+      root.requestPinentry("newPin", error, function(r) {
+        if (r.state === "ok") {
+          done({ master: Model.heldSecretRef(masterName), pin: Model.heldSecretRef(r.name) })
+          return
+        }
+        if (r.state === "empty") { askPin(masterName, "Enter a PIN."); return }
+        if (r.state === "short") { askPin(masterName, "PIN must be at least " + Model.pinMinLength() + " digits"); return }
+        if (r.state === "digits") { askPin(masterName, "PIN must contain only digits"); return }
+        root.forgetVaultSecret(masterName)
+        if (r.state === "norepeat") root.pinentryNotice = Model.pinentryNoRepeatNotice()
+        done(null)
+      }, { minLength: Model.pinMinLength(), repeat: Model.pinentryRepeatPrompt(), digits: true })
+    }
+    var askMaster = function(error) {
+      root.requestPinentry("setupMaster", error, function(r) {
+        if (r.state === "empty") { askMaster("Enter your master password."); return }
+        if (r.state !== "ok") { done(null); return }
+        if (!withPin) { done({ master: Model.heldSecretRef(r.name), pin: "" }); return }
+        askPin(r.name, "")
+      })
+    }
+    askMaster("")
   }
 
   // -------------------------------------------------------------------------

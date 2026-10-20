@@ -158,7 +158,10 @@ case "$cmd" in
   lookup) [ -f "$f" ] || exit 1; cat "$f"; echo ;;
   store) cat > "$f.tmp" && mv "$f.tmp" "$f" ;;
   clear) rm -f "$f" ;;
-  search) [ -f "$f" ] && cat "$f"; exit 0 ;;
+  # As the real tool prints an item: its bus path first, then the attributes
+  # and the secret. The session store checks that path, so a stub that printed
+  # only the value read as "could not see the item" and the store was undone.
+  search) [ -f "$f" ] && printf '[/org/freedesktop/secrets/collection/session/1]\nlabel = stub\nsecret = %s\n' "$(cat "$f")"; exit 0 ;;
   *) exit 2 ;;
 esac`)
   write("systemd-creds", `

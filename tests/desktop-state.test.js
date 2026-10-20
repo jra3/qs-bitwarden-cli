@@ -26,6 +26,7 @@ if (focus) {
 const root = { status: 'locked', currentScreen: 'locked', opened: true, pinentryActive: false,
   isUnlocking: false, pinReady: true, fingerprintReady: false, fidoReady: true,
   fingerprintScanning: false, fidoScanning: false, typedSecretEntry: 'pinentry',
+  sessionRemembered: false,
   masterPassword: 'secret-canary', accountId: 'secret-canary',
   views: [{ focusState: () => ({ targetFocused: true }) }, {}] }
 const state = bind('Service.qml', 'desktopState', { root })
@@ -34,6 +35,7 @@ if (state) {
   const raw = state(); const result = JSON.parse(raw)
   eq('reports lock state', result.status, 'locked')
   eq('reports real hardware readiness', result.fidoReady, true)
+  eq('reports whether a keyring copy would reopen the session', result.sessionRemembered, false)
   eq('reports each view', result.views.length, 2)
   eq('headless view is supported', result.views[1], null)
   check('never includes account or credentials', !raw.includes('secret-canary'), '')

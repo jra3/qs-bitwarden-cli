@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // What a lock leaves behind: `bw lock` and the keyring clear are checked and
-// retried rather than fired and forgotten, a suspend waits for them, turning
-// "remember session" off removes the stored session, and an unload with it
-// off locks.
+// retried rather than fired and forgotten, a suspend or shutdown waits for
+// them, turning "remember session" off removes the stored session, and an
+// unload locks unless a checked keyring copy will reopen the session.
 //
 //   node tests/lock-cleanup.test.js
 
@@ -48,6 +48,11 @@ check("the session clear's exit status is read, retried once and reported",
     && /run\.attempt\s*<\s*2/.test(body("onSessionClearExited"))
     && /errorMessage\s*=/.test(body("onSessionClearExited")),
   body("onSessionClearExited"))
+check("a clear the keyring could not confirm is reported as unchecked, not as done",
+  /Model\.keyringClearUnknownCode\(\)[\s\S]{0,400}errorMessage\s*=\s*"Could not check/.test(body("onSessionClearExited")),
+  body("onSessionClearExited"))
+check("asking for a clear stops counting on the keyring copy",
+  /sessionRemembered\s*=\s*false/.test(body("requestSessionCredentialClear")), body("requestSessionCredentialClear"))
 
 // The clear against a stand-in keyring: exit 0 only once nothing is left.
 {
@@ -65,7 +70,7 @@ account=""; while [ $# -gt 0 ]; do case "$1" in account) account="$2"; shift 2;;
 f="$STORE_DIR/$account"
 case "$cmd" in
   clear) [ -n "$KEEP" ] && exit 1; [ -f "$f" ] || exit 1; rm -f "$f" ;;
-  search) [ -f "$f" ] && printf 'secret = %s\\n' "$(cat "$f")"; exit 0 ;;
+  search) [ -n "$DOWN" ] && exit 1; [ -f "$f" ] && printf 'secret = %s\\n' "$(cat "$f")"; exit 0 ;;
   *) exit 2 ;;
 esac
 `, { mode: 0o755 })
@@ -80,6 +85,14 @@ esac
     check("an entry still there after the clear is a failure", kept.status !== 0, String(kept.status))
     check("and the check prints nothing (the search output holds the secret)",
       kept.stdout === "" && !String(kept.stderr).includes("token"), JSON.stringify(kept))
+    // The secret service not answering is not "gone": the search's own
+    // status used to be dropped, and its empty output counted as nothing left.
+    fs.writeFileSync(path.join(store, "session"), "boot token")
+    const down = run({ KEEP: "1", DOWN: "1" })
+    check("a search that fails is reported as unknown, not as cleared",
+      down.status === Model.keyringClearUnknownCode() && down.status !== 0, String(down.status))
+    check("unknown and still-there are told apart",
+      Model.keyringClearUnknownCode() !== kept.status, `${Model.keyringClearUnknownCode()} vs ${kept.status}`)
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -101,6 +114,22 @@ check("both of them ask for the ack when they finish",
 check("the ack is written to the monitor's stdin",
   /sleepMonitorProc\.write\(Model\.sleepAckLine\(\)\)/.test(body("ackSleep")), body("ackSleep"))
 
+// --- a shutdown locks, whatever the settings ----------------------------------------
+
+// The shell is killed at shutdown, not unloaded, so Component.onDestruction
+// never runs; and a remembered session's key stays valid in bw after the
+// keyring's memory-only copy is gone. The logind monitor is the only hook.
+const shutdownBranch = sleepSignal.slice(sleepSignal.indexOf("Model.shutdownSignalToken()"), sleepSignal.indexOf("Model.sleepSignalToken()"))
+check("a shutdown while unlocked locks and holds the shutdown until the lock settles",
+  /suspendLockPending\s*=\s*true[\s\S]*lockVault\(\)[\s\S]*maybeAckSleep\(\)/.test(shutdownBranch), shutdownBranch)
+check("a shutdown does not look at lockOnSuspend or rememberSession",
+  shutdownBranch.length > 0 && !/lockOnSuspend|rememberSession/.test(shutdownBranch), shutdownBranch)
+check("a shutdown with nothing to lock is let go at once",
+  /status\s*!==\s*"unlocked"\)\s*\{\s*ackSleep\(\)/.test(shutdownBranch), shutdownBranch)
+const monitorBlock = src.slice(src.indexOf("id: sleepMonitorProc"), src.indexOf("id: sleepMonitorProc") + 300)
+check("the monitor runs whenever the plugin does, not only with lockOnSuspend on",
+  /running:\s*root\.live\s*$/m.test(monitorBlock), monitorBlock)
+
 // --- what a lock drops -----------------------------------------------------------------
 
 check("a lock drops the old master password held for a re-seal",
@@ -121,14 +150,32 @@ check("and a start with it off removes one left from before",
   /if\s*\(!rememberSession\)\s*requestSessionCredentialClear\(\)/.test(body("refreshAccountCredentials")),
   body("refreshAccountCredentials"))
 const destruction = src.slice(src.indexOf("Component.onDestruction:"), src.indexOf("Component.onDestruction:") + 300)
-check("an unload while unlocked with the session not remembered locks bw",
+check("an unload while unlocked locks bw unless a checked keyring copy will reopen the session",
   /root\.lockSessionOnUnload\(\)/.test(destruction)
-    && /if \(!session \|\| rememberSession\) return/.test(body("lockSessionOnUnload"))
+    && /if \(!session \|\| \(rememberSession && sessionRemembered\)\) return/.test(body("lockSessionOnUnload"))
     // With the helper holding the key, it starts the lock itself, detached.
     && /vaultHelperLine\("exec", \{ id: 0, argv: Model\.lockCommand\(\),[\s\S]*?detach: true/.test(body("lockSessionOnUnload"))
     // Falling back, the session is added here for that one command.
     && /env\[Model\.sessionEnvVar\(\)\] = String\(session\)\s*Quickshell\.execDetached\(\{ command: Model\.lockCommand\(\), environment: env \}\)/
       .test(body("lockSessionOnUnload")),
   destruction + "\n" + body("lockSessionOnUnload"))
+
+// --- the store: no fallback, and the panel's side of a refused one ------------------
+
+const stored = body("onSessionStored")
+check("a session is counted as remembered only after the store checked out",
+  /exitCode === 0\)\s*\{\s*sessionRemembered = true/.test(stored), stored)
+check("a refused store turns remembering off and tells the user",
+  /sessionRemembered = false[\s\S]*rememberSessionProblem = sessionStoreProblemText\(exitCode\)[\s\S]*errorMessage = "Session not remembered/.test(stored),
+  stored)
+check("each way the store can refuse has its own explanation",
+  /keyringStoreMisplacedCode\(\)/.test(body("sessionStoreProblemText"))
+    && /keyringStoreUnverifiedCode\(\)/.test(body("sessionStoreProblemText")), body("sessionStoreProblemText"))
+check("the settings row says the setting is not in effect",
+  /entry\.key === "rememberSession"[\s\S]{0,200}rememberSessionProblem/.test(body("settingNote")), body("settingNote"))
+check("a lock, logout or switch forgets the keyring copy with the rest",
+  /sessionRemembered = false/.test(body("dropVaultState")), body("dropVaultState"))
+check("a session read back from the keyring counts as remembered",
+  /sessionRemembered = true/.test(body("onKeyringLookupFinished")), body("onKeyringLookupFinished"))
 
 done()

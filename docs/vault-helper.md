@@ -43,7 +43,11 @@ or copy it.
 
 Locking, logging out and switching accounts tell the helper to forget
 everything. A lock that is still running `bw lock` keeps its own copy of the
-key until it finishes.
+key until it finishes. A shell unload while unlocked starts a detached
+`bw lock` through the helper before it stops, unless the session is
+remembered and its keyring copy was checked to be in the memory-only
+collection; suspend, shutdown and reboot lock through the normal path under
+a logind delay inhibitor.
 
 ## How the shell talks to it
 

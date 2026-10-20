@@ -1806,21 +1806,31 @@ var PINENTRY_TIMEOUT_S = 120
 var PINENTRY_GIVE_UP_S = PINENTRY_TIMEOUT_S + 30
 // Exit codes of the script (and 127, 126 and 128+ for a program that is
 // missing, a helper that does not know the capture, or a kill).
-var PINENTRY_EXIT = { cancelled: 1, empty: 3, failed: 4, short: 5, missing: 127 }
+// `digits` and `norepeat` are a new PIN's: an answer that is not all digits,
+// and a pinentry that took the PIN once when it was asked to take it twice
+// (SETREPEAT), so nothing confirmed it.
+var PINENTRY_EXIT = { cancelled: 1, empty: 3, failed: 4, short: 5, digits: 6, norepeat: 7, missing: 127 }
 
 function pinentryExitCodes() {
   return { cancelled: PINENTRY_EXIT.cancelled, empty: PINENTRY_EXIT.empty,
-           failed: PINENTRY_EXIT.failed, short: PINENTRY_EXIT.short, missing: PINENTRY_EXIT.missing }
+           failed: PINENTRY_EXIT.failed, short: PINENTRY_EXIT.short, digits: PINENTRY_EXIT.digits,
+           norepeat: PINENTRY_EXIT.norepeat, missing: PINENTRY_EXIT.missing }
 }
 
 // pinentry's own "operation cancelled" is GPG_ERR_CANCELED (99) from source
 // 5, 83886179; any code whose low 16 bits are 99 is read as a cancel. Its
 // timeout, GPG_ERR_TIMEOUT (62), is one too: nobody answered.
+//
+// A repeat prompt ($5) asks pinentry for the answer twice in its own window
+// (SETREPEAT), so a new PIN is confirmed without the panel seeing either
+// copy. A pinentry that confirmed says `S PIN_REPEATED` before its OK; one
+// that cannot (pinentry-tty, an old curses) answers OK after one entry, and
+// that is refused rather than taken as confirmed.
 var PINENTRY_SCRIPT = [
   PINENTRY_RESOLVE,
   // The description and error can name the account, so they come in the
   // environment, not argv, and are gone before pinentry starts.
-  "__title=\"$2\"; __prompt=\"$3\"; __min=\"${4:-0}\"",
+  "__title=\"$2\"; __prompt=\"$3\"; __min=\"${4:-0}\"; __repeat=\"$5\"; __digits=\"${6:-0}\"",
   "__desc=\"$" + PINENTRY_DESC_ENV + "\"; __err=\"$" + PINENTRY_ERR_ENV + "\"",
   "unset " + PINENTRY_DESC_ENV + " " + PINENTRY_ERR_ENV,
   "command -v -- \"$__prog\" >/dev/null 2>&1 || exit " + PINENTRY_EXIT.missing,
@@ -1840,18 +1850,23 @@ var PINENTRY_SCRIPT = [
   "__enc \"$__desc\"; __ask \"SETDESC $__e\"",
   "__enc \"$__prompt\"; __ask \"SETPROMPT $__e\"",
   "if [ -n \"$__err\" ]; then __enc \"$__err\"; __ask \"SETERROR $__e\"; fi",
+  "if [ -n \"$__repeat\" ]; then __enc \"$__repeat\"; __ask \"SETREPEAT $__e\"; __ask \"SETREPEATERROR PINs do not match\"; fi",
   "__ask \"SETTIMEOUT " + PINENTRY_TIMEOUT_S + "\"",
   "printf 'GETPIN\\n' >&\"${PE[1]}\" || exit " + PINENTRY_EXIT.failed,
-  "__d=''",
+  "__d=''; __repeated=0",
   "while IFS= read -r -t " + PINENTRY_GIVE_UP_S + " -u \"${PE[0]}\" __l; do",
   "  case \"$__l\" in",
   "    'D '*) __d=\"$__d${__l:2}\" ;;",
+  "    'S PIN_REPEATED'|'S PIN_REPEATED '*) __repeated=1 ;;",
   "    OK|OK\\ *)",
   "      printf 'BYE\\n' >&\"${PE[1]}\"",
   "      [ -n \"$__d\" ] || exit " + PINENTRY_EXIT.empty,
   // The length of what was typed: each %XX stands for one character.
   "      __t=\"${__d//[^%]/}\"; __n=$(( ${#__d} - 2 * ${#__t} ))",
   "      if [[ \"$__min\" =~ ^[0-9]+$ ]] && (( __n < __min )); then exit " + PINENTRY_EXIT.short + "; fi",
+  // Digits are never encoded, so anything else in the data is not a digit.
+  "      if [ \"$__digits\" = 1 ] && [[ ! \"$__d\" =~ ^[0-9]+$ ]]; then exit " + PINENTRY_EXIT.digits + "; fi",
+  "      if [ -n \"$__repeat\" ] && [ \"$__repeated\" != 1 ]; then exit " + PINENTRY_EXIT.norepeat + "; fi",
   "      printf '%s' \"$__d\"; exit 0 ;;",
   "    ERR|ERR\\ *)",
   "      __c=\"${__l#ERR }\"; __c=\"${__c%% *}\"",
@@ -1866,6 +1881,12 @@ var PINENTRY_SCRIPT = [
 // opens pinentry again, and the field is used only when picked.
 function pinentryFailedNotice() {
   return "Pinentry stopped before answering. Try again, or type it here instead."
+}
+
+// A new PIN was asked for twice (SETREPEAT) and this pinentry took it once:
+// nothing confirmed it, so it was not kept. Not remembered either.
+function pinentryNoRepeatNotice() {
+  return "This pinentry cannot ask for the PIN twice to confirm it. Type it here instead."
 }
 
 // `bw unlock` refusing the password itself, as opposed to any other failure
@@ -1906,11 +1927,15 @@ function pinentryProgram(configured) {
 
 // `opts`: { title, description, prompt, error } as plain text, and
 // `minLength`: an answer of fewer characters exits short (nothing is held).
+// `repeat` is the prompt of a second field that must match (a new PIN), and
+// `digits` refuses an answer that is not all digits; both exit with their
+// own code and print nothing.
 function pinentryCommand(program, opts) {
   var o = opts || {}
   return ["bash", "-c", PINENTRY_SCRIPT, "_", pinentryProgram(program),
     pinentryText(o.title), pinentryText(o.prompt),
-    String(Math.max(0, Math.floor(Number(o.minLength) || 0)))]
+    String(Math.max(0, Math.floor(Number(o.minLength) || 0))),
+    pinentryText(o.repeat), o.digits ? "1" : "0"]
 }
 
 // The environment pinentryCommand() reads its description and error from
@@ -1952,18 +1977,28 @@ function typedSecretEntry(o) {
   return "wait"
 }
 
-// purpose: "unlock" (master password), "pin", "reprompt".
+// purpose: "unlock" (master password), "pin", "reprompt", "login" (the
+// email login's master password), "setupMaster" (the password a quick-unlock
+// setup form confirms) and "newPin" (the PIN that form chooses).
 function pinentryDescription(purpose, email) {
   var who = String(email || "").trim()
   var suffix = who ? " for " + who : ""
   if (purpose === "pin") return "Enter the PIN that unlocks Bitwarden" + suffix
   if (purpose === "reprompt") return "Confirm your Bitwarden master password" + suffix
+  if (purpose === "login") return "Log in to Bitwarden" + (who ? " as " + who : "")
+  if (purpose === "setupMaster") return "Confirm your Bitwarden master password to add an unlock method" + suffix
+  if (purpose === "newPin") return "Choose the PIN that will unlock Bitwarden" + suffix
   return "Unlock Bitwarden" + suffix
 }
 
 function pinentryPrompt(purpose) {
-  return purpose === "pin" ? "PIN:" : "Master password:"
+  if (purpose === "pin") return "PIN:"
+  if (purpose === "newPin") return "New PIN:"
+  return "Master password:"
 }
+
+// The second field of a new PIN (SETREPEAT).
+function pinentryRepeatPrompt() { return "Repeat PIN:" }
 
 function keyringClearPinCommand(slot) {
   return keyringClearEntryCommand(keyringEntryName(KEYRING_PIN, slot))

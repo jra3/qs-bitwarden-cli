@@ -225,3 +225,14 @@ The binary is built reproducibly and attested like the SSH helper
 gh attestation verify bin/x86_64-linux/qs-bitwarden-vault --repo Elevate08/qs-bitwarden-cli
 bin/x86_64-linux/qs-bitwarden-vault --self-test
 ```
+
+From a linked worktree (`git worktree add`), `build-agent.sh` cannot enter the
+pinned image on its own: the container sees the checkout but not the gitdir
+it points at. `scripts/rebuild-helpers-local.sh` exports HEAD on the host and
+runs the same build there, as you rather than root:
+
+```bash
+./scripts/rebuild-helpers-local.sh            # compare bin/ with a build of HEAD
+./scripts/rebuild-helpers-local.sh write      # rebuild bin/ and SHA256SUMS after a source change
+./scripts/rebuild-helpers-local.sh test       # cargo test for every helper, in the same image
+```

@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **The helpers can be rebuilt from a linked worktree.**
+  `scripts/build-agent.sh` re-executes itself in the pinned image with the
+  checkout mounted, which fails in a `git worktree` checkout (the gitdir is
+  outside the mount) and leaves root-owned files in a primary one.
+  `scripts/rebuild-helpers-local.sh` clones HEAD to a temporary directory
+  on the host and runs the same script there as the invoking user, then
+  copies the result into `bin/` on request. The release build itself is
+  unchanged.
+
 ## [1.11.8] - 2026-10-26
 
 ### Security

@@ -199,8 +199,12 @@ other way, such as `gcr-prompter` for `pinentry-gnome3`
 
 It is checked like the other helpers: present, executable, the right
 architecture, the checksum in `bin/SHA256SUMS`, its own self-test, and the
-protocol version. A locally built one (`vault/target/debug/`) is used if the
-shipped one is absent or unusable.
+protocol version. Without `bin/SHA256SUMS`, or without its line in it, the
+shipped binary is not run at all; the check reports an incomplete install. A
+locally built one (`vault/target/debug/`) is tried after the shipped one
+only when `allowDevelopmentHelpers` is `true` in `shell.json`; a plugin
+install never falls back to one on its own, since it has no recorded digest
+and no provenance.
 
 If none can be used when the shell starts, the vault stays locked: commands
 wait, and a banner says why and offers to check again, which runs the whole

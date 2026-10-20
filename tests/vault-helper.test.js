@@ -215,6 +215,21 @@ check("an item from the helper says what it has without holding it",
       && /allowVaultWithoutHelper/.test(Model.vaultHelperUnavailableWarning("")), Model.vaultHelperUnavailableWarning(""))
   const parsed = Model.parseVaultHelperInspection("")
   check("a killed check (no output) is not ready", !Model.helperReady(parsed) && parsed.state === "missing", parsed.state)
+  // A locally built helper is a developer's choice, made in shell.json, not
+  // something a plugin install falls back to on its own.
+  check("only a literal true in shell.json allows development helpers, and it is off by default",
+    /readonly property bool allowDevelopmentHelpers: setting\("allowDevelopmentHelpers", false\) === true/.test(service), "")
+  for (const name of ["vaultHelperInspectCommand", "unlockKeyInspectCommand", "sshAgentHelperInspectCommand"]) {
+    check(`${name} is asked with that setting`,
+      service.includes(`Model.${name}(root.sshAgentPluginDir, root.allowDevelopmentHelpers)`), name)
+  }
+  check("it is not in the settings screen",
+    !/allowDevelopmentHelpers/.test(readPluginSource("BitwardenModel.js").split("SETTINGS_SCHEMA")[1] || ""), "")
+  const noSums = Model.vaultHelperInspectCommand("/opt/bw")[2]
+  check("a shipped helper without SHA256SUMS is refused before it is run",
+    noSums.indexOf("__state=checksum-missing") >= 0 && noSums.indexOf("__state=checksum-missing") < noSums.indexOf("--version"), noSums)
+  check("the development build is not a candidate unless allowed",
+    !noSums.includes("target/debug") && Model.vaultHelperInspectCommand("/opt/bw", true)[2].includes("target/debug"), noSums)
 }
 
 // --- the real helper -------------------------------------------------------------

@@ -5345,27 +5345,35 @@ function sshAuthSockDiagnostic(sock, runtimeDir) {
 // Shipped helpers are checked before use: present, executable, right
 // architecture, matching checksum, passing self-test, matching protocol.
 // SHA256SUMS sits beside the binary, so it catches stale or incomplete files,
-// not tampering; provenance is covered by the release attestation.
+// not tampering; provenance is covered by the release attestation. A shipped
+// binary is never run before its line in SHA256SUMS has matched it: a
+// missing manifest used to leave the checksum "unchecked" and the helper
+// running, which hid an incomplete install behind a green state.
 var SSH_AGENT_BUNDLED_RELATIVE = "bin/x86_64-linux/qs-bitwarden-ssh-agent"
 var SSH_AGENT_SUMS_RELATIVE = "bin/SHA256SUMS"
-// Cargo's debug build, used when the shipped binary is absent or unusable;
-// the settings screen names which one is running.
+// Cargo's debug build. Tried only with `allowDevelopmentHelpers` set to
+// `true` in shell.json (a source checkout), never on its own: it has no
+// digest and no provenance, and a plugin install falling back to one is a
+// broken install, not a working one. The settings screen names which one is
+// running.
 var SSH_AGENT_DEVELOPMENT_RELATIVE = "agent/target/debug/qs-bitwarden-ssh-agent"
 
-// In preference order: shipped artifact, then local build.
-function helperCandidates(pluginDir, spec) {
+// In preference order: shipped artifact, then the local build when allowed.
+function helperCandidates(pluginDir, spec, allowDevelopment) {
   var root = cleanAbsoluteDir(pluginDir)
   if (!root) return []
-  return [
-    { source: "bundled", path: root + "/" + spec.bundled },
-    { source: "development", path: root + "/" + spec.development }
-  ]
+  var candidates = [{ source: "bundled", path: root + "/" + spec.bundled }]
+  if (allowDevelopment === true) {
+    candidates.push({ source: "development", path: root + "/" + spec.development })
+  }
+  return candidates
 }
 
 // The absolute path of the candidate the inspection accepted, or "". Never a
-// guess: an unaccepted source launches nothing.
+// guess: an unaccepted source launches nothing. Only an inspection that was
+// allowed the development build reports it, so it is offered here too.
 function helperPath(pluginDir, spec, source) {
-  var candidates = helperCandidates(pluginDir, spec)
+  var candidates = helperCandidates(pluginDir, spec, true)
   for (var i = 0; i < candidates.length; i++) {
     if (candidates[i].source === source) return candidates[i].path
   }
@@ -5390,37 +5398,45 @@ function sshAgentHelperSourceLabel(source) {
   return ""
 }
 
-// Checks both candidates in one shell and reports the first usable one as
+// Checks the candidates in one shell and reports the first usable one as
 // `key=value` lines; none of the helper's own output reaches a message.
 // `spec` gives the binary name, candidate paths and the sed expression that
-// reads its protocol version from `--version`.
-function helperInspectCommand(pluginDir, spec) {
+// reads its protocol version from `--version`. `allowDevelopment` (only a
+// literal true) adds the local build after the shipped one.
+function helperInspectCommand(pluginDir, spec, allowDevelopment) {
   var root = cleanAbsoluteDir(pluginDir)
   if (!root) return ["bash", "-c", "echo state=missing"]
   // The binary's line in SHA256SUMS: its path relative to bin/, exactly.
   var sumsPath = spec.bundled.replace(/^bin\//, "")
   var sumsLine = "^[0-9a-f]{64}  " + sumsPath.replace(/[.]/g, "\\.") + "$"
+  var pairs = helperCandidates(root, spec, allowDevelopment).map(function(c) {
+    return shellQuote(c.source + ":" + c.path.slice(root.length + 1))
+  })
 
   var script = "__root=" + shellQuote(root) + "; "
     + "__report() { printf '%s\\n' \"$@\"; exit 0; }; "
     + "__found=''; "
-    // Shipped first; a local build only if that is absent or unusable.
-    + "for __pair in " + shellQuote("bundled:" + spec.bundled)
-    + " " + shellQuote("development:" + spec.development) + "; do "
+    // Shipped first; a local build, when allowed, only if that is absent or
+    // unusable.
+    + "for __pair in " + pairs.join(" ") + "; do "
     + "  __source=\"${__pair%%:*}\"; __rel=\"${__pair#*:}\"; __bin=\"$__root/$__rel\"; "
     + "  [ -e \"$__bin\" ] || continue; "
     + "  __found=\"$__source\"; "
     + "  [ -f \"$__bin\" ] || { __state=not-a-file; continue; }; "
     + "  [ -x \"$__bin\" ] || { __state=not-executable; continue; }; "
-    // ELF magic first, so LFS placeholders and truncated files fail clearly.
+    // A shipped binary with no manifest beside it is an incomplete install:
+    // nothing more is read of it, and it is not run, not even for `--version`.
+    + "  __checksum=unchecked; "
+    + "  if [ \"$__source\" = bundled ] && [ ! -f \"$__root/" + SSH_AGENT_SUMS_RELATIVE + "\" ]; then "
+    + "    __checksum=missing; __state=checksum-missing; continue; fi; "
+    // ELF magic next, so LFS placeholders and truncated files fail clearly.
     + "  __magic=\"$(head -c 4 -- \"$__bin\" 2>/dev/null | od -An -tx1 | tr -d ' \\n')\"; "
     + "  [ \"$__magic\" = \"7f454c46\" ] || { __state=not-elf; continue; }; "
     + "  __arch=\"$(od -An -tx1 -j 18 -N 1 -- \"$__bin\" 2>/dev/null | tr -d ' \\n')\"; "
     + "  [ \"$__arch\" = \"3e\" ] || { __state=wrong-architecture; continue; }; "
     // Shipped artifact only, and only its own SHA256SUMS line, so one stale
     // helper cannot disable the other. A missing line is a mismatch.
-    + "  __checksum=unchecked; "
-    + "  if [ \"$__source\" = bundled ] && [ -f \"$__root/" + SSH_AGENT_SUMS_RELATIVE + "\" ]; then "
+    + "  if [ \"$__source\" = bundled ]; then "
     + "    __line=\"$(grep -E " + shellQuote(sumsLine) + " \"$__root/" + SSH_AGENT_SUMS_RELATIVE + "\" | head -1)\"; "
     + "    if [ -n \"$__line\" ] && ( cd \"$__root/bin\" && printf '%s\\n' \"$__line\" | sha256sum -c --status ) 2>/dev/null; then "
     + "      __checksum=match; "
@@ -5450,8 +5466,8 @@ var SSH_AGENT_HELPER_SPEC = {
   protocolSed: "s/.*protocol \\([0-9]*\\).*/\\1/p"
 }
 
-function sshAgentHelperInspectCommand(pluginDir) {
-  return helperInspectCommand(pluginDir, SSH_AGENT_HELPER_SPEC)
+function sshAgentHelperInspectCommand(pluginDir, allowDevelopment) {
+  return helperInspectCommand(pluginDir, SSH_AGENT_HELPER_SPEC, allowDevelopment)
 }
 
 // A helper's state before its inspection has run.
@@ -5495,6 +5511,9 @@ function helperMessages(noun, manifest, protocolMismatch) {
       + "release ships x86_64 only.",
     "checksum-mismatch": the + " does not match its recorded checksum. That usually "
       + "means a stale binary after an update, or an incomplete clone.",
+    "checksum-missing": the + " has no recorded checksum: bin/SHA256SUMS is missing, so the "
+      + "install is incomplete and the shipped binary is not run. Reinstall the plugin; a "
+      + "source checkout can set allowDevelopmentHelpers to use its own build.",
     "no-version": the + " did not report a usable version.",
     "self-test-failed": the + " failed its own self-test on this machine.",
     "protocol-mismatch": the + " " + protocolMismatch + " than this version of the plugin. "
@@ -5537,8 +5556,8 @@ var UNLOCK_KEY_SPEC = {
   protocolSed: "s/.*cli v\\([0-9]*\\).*/\\1/p"
 }
 
-function unlockKeyInspectCommand(pluginDir) {
-  return helperInspectCommand(pluginDir, UNLOCK_KEY_SPEC)
+function unlockKeyInspectCommand(pluginDir, allowDevelopment) {
+  return helperInspectCommand(pluginDir, UNLOCK_KEY_SPEC, allowDevelopment)
 }
 
 var UNLOCK_KEY_MESSAGES = helperMessages("quick-unlock tool", "unlock-key/Cargo.toml",
@@ -5591,8 +5610,8 @@ var VAULT_HELPER_SPEC = {
   protocolSed: "s/.*protocol \\([0-9]*\\).*/\\1/p"
 }
 
-function vaultHelperInspectCommand(pluginDir) {
-  return helperInspectCommand(pluginDir, VAULT_HELPER_SPEC)
+function vaultHelperInspectCommand(pluginDir, allowDevelopment) {
+  return helperInspectCommand(pluginDir, VAULT_HELPER_SPEC, allowDevelopment)
 }
 
 var VAULT_HELPER_MESSAGES = helperMessages("vault helper", "vault/Cargo.toml",

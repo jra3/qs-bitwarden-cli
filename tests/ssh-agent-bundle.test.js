@@ -55,8 +55,14 @@ eq("the bundled path is architecture-scoped",
 eq("the development path is cargo's debug output",
   Model.SSH_AGENT_DEVELOPMENT_RELATIVE, "agent/target/debug/qs-bitwarden-ssh-agent")
 
-const candidates = Model.helperCandidates("/opt/bw", Model.SSH_AGENT_HELPER_SPEC)
-eq("both candidates are offered", candidates.length, 2)
+const candidates = Model.helperCandidates("/opt/bw", Model.SSH_AGENT_HELPER_SPEC, true)
+eq("both candidates are offered when the development build is allowed", candidates.length, 2)
+// A plugin install has no reason to run an untracked build; only a literal
+// true in shell.json (allowDevelopmentHelpers) adds it.
+eq("without that the shipped helper is the only candidate",
+  JSON.stringify(Model.helperCandidates("/opt/bw", Model.SSH_AGENT_HELPER_SPEC).map(c => c.source)), '["bundled"]')
+eq("and a truthy string does not count",
+  Model.helperCandidates("/opt/bw", Model.SSH_AGENT_HELPER_SPEC, "true").length, 1)
 eq("the shipped helper is preferred", candidates[0].path, "/opt/bw/bin/x86_64-linux/qs-bitwarden-ssh-agent")
 eq("the development build is the fallback", candidates[1].path, "/opt/bw/agent/target/debug/qs-bitwarden-ssh-agent")
 eq("the preferred one is labelled", candidates[0].source, "bundled")
@@ -85,8 +91,8 @@ function inTemp(fn) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "qsbw-bundle-"))
   try { return fn(dir) } finally { fs.rmSync(dir, { recursive: true, force: true }) }
 }
-const inspect = (pluginDir) => {
-  const cmd = Model.sshAgentHelperInspectCommand(pluginDir)
+const inspect = (pluginDir, allowDevelopment) => {
+  const cmd = Model.sshAgentHelperInspectCommand(pluginDir, allowDevelopment)
   const run = spawnSync(cmd[0], cmd.slice(1), { encoding: "utf8", env: { PATH: "/usr/bin:/bin" } })
   return Model.parseSshAgentHelperInspection(run.stdout)
 }
@@ -153,14 +159,36 @@ inTemp(dir => {
   eq("and the feature stays off", Model.helperReady(result), false)
 })
 
-// A development build with no shipped artifact: the dev loop must keep working.
+// A shipped helper with no SHA256SUMS beside it: an incomplete install. The
+// binary is not run at all, not even for `--version`, and the state says
+// what is missing rather than reading as a checksum nobody checked.
+inTemp(dir => {
+  const target = path.join(dir, "bin", "x86_64-linux")
+  fs.mkdirSync(target, { recursive: true })
+  const copy = path.join(target, "qs-bitwarden-ssh-agent")
+  // A stand-in that leaves a mark if it is ever executed.
+  fs.writeFileSync(copy, "#!/bin/sh\ntouch \"$(dirname \"$0\")/ran\"\n", { mode: 0o755 })
+  const result = inspect(dir)
+  eq("a shipped helper without a manifest is refused", result.state, "checksum-missing")
+  eq("its checksum is reported as missing, not unchecked", result.checksum, "missing")
+  eq("and the feature stays off", Model.helperReady(result), false)
+  check("the binary was never executed", !fs.existsSync(path.join(target, "ran")), "it ran")
+  check("the message says the install is incomplete and how to fix it",
+    /SHA256SUMS/.test(result.message) && /reinstall/i.test(result.message), result.message)
+})
+
+// A development build with no shipped artifact: the dev loop must keep
+// working, but only when shell.json says this is a dev loop.
 inTemp(dir => {
   const target = path.join(dir, "agent", "target", "debug")
   fs.mkdirSync(target, { recursive: true })
   fs.copyFileSync(bundled, path.join(target, "qs-bitwarden-ssh-agent"))
   fs.chmodSync(path.join(target, "qs-bitwarden-ssh-agent"), 0o755)
-  const result = inspect(dir)
-  eq("a development build is usable", result.state, "ok")
+  const unasked = inspect(dir)
+  eq("a development build is not used unless asked for", unasked.state, "missing")
+  eq("and the feature stays off", Model.helperReady(unasked), false)
+  const result = inspect(dir, true)
+  eq("with allowDevelopmentHelpers a development build is usable", result.state, "ok")
   eq("and is identified as such", result.source, "development")
   eq("the feature is enabled from it", Model.helperReady(result), true)
   check("no checksum is claimed for an untracked build",
@@ -168,7 +196,7 @@ inTemp(dir => {
 })
 
 // Both present: the shipped artifact wins, but a broken one does not strand
-// a developer who has a working local build.
+// a developer who has a working local build and has said so.
 inTemp(dir => {
   const shipped = path.join(dir, "bin", "x86_64-linux")
   fs.mkdirSync(shipped, { recursive: true })
@@ -178,7 +206,10 @@ inTemp(dir => {
   fs.mkdirSync(dev, { recursive: true })
   fs.copyFileSync(bundled, path.join(dev, "qs-bitwarden-ssh-agent"))
   fs.chmodSync(path.join(dev, "qs-bitwarden-ssh-agent"), 0o755)
-  const result = inspect(dir)
+  const unasked = inspect(dir)
+  check("without the setting the broken shipped helper is what is reported",
+    unasked.state !== "ok" && unasked.source === "bundled", JSON.stringify(unasked))
+  const result = inspect(dir, true)
   eq("a broken shipped helper falls back to the development build", result.state, "ok")
   eq("and says which one it used", result.source, "development")
 })

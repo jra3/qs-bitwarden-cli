@@ -402,6 +402,21 @@ The first account lives where a terminal `bw` finds it (`~/.config/Bitwarden CLI
 
 While your vault is open, its session key and every item's secrets are held by a small helper process (`bin/x86_64-linux/qs-bitwarden-vault`), not by the shell. If the shell crashes, the core dump systemd keeps has no session key and no passwords in it, except a value you had revealed or an item you were editing, and the shell's own crash dumps still work for diagnosing it. Opening an item shows no secret until you reveal it. A value you copy goes from the helper straight to the clipboard; TOTP codes and search are answered by the helper too. It talks only to the shell that started it, on its stdin and stdout.
 
+### Clipboard history
+
+Every copy is made with `wl-copy --sensitive`, which offers the selection with
+the `x-kde-passwordManagerHint` type beside the text. Omarchy's clipboard
+history (the shell's clipboard plugin, `wl-paste --watch` into its
+`capture.sh`) checks the selection's types when a copy lands and keeps nothing
+that carries the hint, so a copied password, TOTP code or generated password
+does not appear in it. That is what is guaranteed: the hint is set on every
+copy this plugin makes, and the lock-time clear recognises it to clear only
+our own copies. What is not: a clipboard manager other than Omarchy's that
+does not look for the hint will record the copy like any other, and a program
+that reads the clipboard while the copy is there sees the value either way. The timed clear and the lock-time clear
+bound how long that is, not who may read it.
+
+
 It ships and is verified like the other helpers. If it is missing or fails its check, the vault stays locked and a banner says why, with a click to check again. Setting `allowVaultWithoutHelper` to `true` in `shell.json` holds the vault in the shell instead, as before the helper, with a banner saying crash protection is off. **[How it works and what it does not cover →](docs/vault-helper.md)**
 
 ### How quick unlock stores your password
@@ -540,7 +555,7 @@ The following settings are read from the plugin's own entry in the
 | Key | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `autoLockMinutes` | `number` | `15` | Minutes of inactivity before automatically locking the vault (`0` to disable). Range `0`-`1440`; out of range is clamped and an unreadable value falls back to `15`. |
-| `clearClipboardSec` | `number` | `30` | Seconds before automatically clearing copied secrets from the clipboard (`0` to disable). The clear is the copy's own lifetime (`wl-copy` under `timeout`), so it survives a shell restart and never touches something copied later. Range `0`-`300`; out of range is clamped and an unreadable value falls back to `30`. |
+| `clearClipboardSec` | `number` | `30` | Seconds before automatically clearing copied secrets from the clipboard (`0` to disable). The clear is the copy's own lifetime (`wl-copy` under `timeout`), so it survives a shell restart and never touches something copied later; a lock ends the helper's copies early whatever is left on the timer. Copies are marked sensitive (`x-kde-passwordManagerHint`), which Omarchy's clipboard history skips -- see [Clipboard history](#clipboard-history). Range `0`-`300`; out of range is clamped and an unreadable value falls back to `30`. |
 | `lockOnScreenLock` | `boolean` | `true` | Lock the vault as soon as the screen locks, rather than waiting out `autoLockMinutes`. Reads the Omarchy lock screen's own state and the compositor's session-lock state (`omarchy-hyprland-session-locked`), so it follows a manual lock, an idle lock and a `hyprlock` started by hand alike. A shell without the lock plugin, or a compositor that cannot be asked, never reads as locked. |
 | `lockOnSuspend` | `boolean` | `true` | Lock the vault when the machine is going to sleep, so no unlocked session key is left in the suspended machine's memory. Holds a `delay` sleep inhibitor until `bw lock` and the keyring clear have finished, at most 4 seconds. Needs `gdbus` (glib2), `systemd-inhibit` and `setsid` (util-linux). The monitor and its children stop when the plugin unloads; without these tools the setting is inert. |
 | `rememberSession` | `boolean` | `true` | Persist session token in OS keyring (`secret-tool`) while unlocked. Survives a shell restart, never a reboot -- see the note above. Turning it off removes a stored session at once, and with it off an unload while unlocked runs `bw lock`. |

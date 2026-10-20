@@ -5194,16 +5194,24 @@ function uwsmWriteCommand() {
 }
 
 // Removes everything the plugin stores outside its folder (keyring, state,
-// data), since `omarchy plugin remove` has no uninstall hook. Leaves bw's own
-// sign-in (the default account) and shell.json alone; the other accounts'
-// sign-ins live in the plugin's data and go with it.
+// data, and the keyring repair's backups), since `omarchy plugin remove` has
+// no uninstall hook. Leaves bw's own sign-in (the default account) and
+// shell.json alone; the other accounts' sign-ins live in the plugin's data
+// and go with it.
 function pluginDataRemoveCommand() {
   var script = "test -n \"${HOME:-}\" || exit " + PLUGIN_DATA_EXIT_NO_HOME + "; "
     + "__state=\"${XDG_STATE_HOME:-$HOME/.local/state}/qs-bitwarden-cli\"; "
     + "__data=\"${XDG_DATA_HOME:-$HOME/.local/share}/qs-bitwarden-cli\"; "
+    + "__keyrings=\"${XDG_DATA_HOME:-$HOME/.local/share}/keyrings\"; "
     // Each step reports independently; one failing does not stop the rest.
     + "__done=''; "
     + "if secret-tool clear service qs-bitwarden-cli 2>/dev/null; then __done=\"$__done keyring\"; fi; "
+    // scripts/repair-keyring.sh keeps the keyring file it rewrote as
+    // <file>.before-repair-<time>: a copy of every secret in it. Only files
+    // of exactly that name beside the default keyring, nothing else there.
+    + "if [ -d \"$__keyrings\" ] && [ ! -L \"$__keyrings\" ] "
+    + "&& find \"$__keyrings\" -maxdepth 1 -type f -name 'Default_keyring.keyring.before-repair-*' | grep -q .; then "
+    + "  find \"$__keyrings\" -maxdepth 1 -type f -name 'Default_keyring.keyring.before-repair-*' -delete && __done=\"$__done backups\"; fi; "
     + "if [ -e \"$__state\" ]; then rm -rf -- \"$__state\" && __done=\"$__done state\"; fi; "
     + "if [ -d \"$__data/accounts\" ] && [ ! -L \"$__data/accounts\" ] "
     + "&& find \"$__data/accounts\" -mindepth 1 -maxdepth 1 -type d -name '????????????????' | grep -q .; "
@@ -5229,6 +5237,7 @@ function parsePluginDataRemoval(exitCode, stdout) {
   if (line.indexOf("state") >= 0) cleared.push("learned suggestions")
   if (line.indexOf("data") >= 0) cleared.push("exported public keys")
   if (line.indexOf("accounts") >= 0) cleared.push("the sign-ins of accounts added in the panel")
+  if (line.indexOf("backups") >= 0) cleared.push("the keyring repair's backup copies")
   if (cleared.length === 0) {
     return { ok: true, message: "Nothing was left to remove." }
   }

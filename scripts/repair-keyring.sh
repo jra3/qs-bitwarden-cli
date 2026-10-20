@@ -19,8 +19,14 @@
 #
 # KEYRING_FILE defaults to the default collection's file. --check only reports:
 # exit 0 when nothing needs repair, 3 when it does. Otherwise the original is
-# kept beside the file as <file>.before-repair-<time> before anything is
-# written. No secret is ever printed.
+# kept beside the file as <file>.before-repair-<time>, mode 600, before
+# anything is written. No secret is ever printed.
+#
+# That backup is the whole keyring file, every application's secrets in it,
+# so it is not kept for good: every run but --check removes backups of this
+# file older than RETAIN_DAYS, and the panel's "Remove plugin data" removes
+# them all (docs/uninstall.md says how by hand). Only files named exactly
+# <file>.before-repair-* are touched; nothing else beside the keyring is.
 #
 # --auto is how the plugin runs it at every start: a missing or binary keyring
 # is not an error, messages go to stderr, and the last line on stdout is
@@ -30,9 +36,21 @@
 set -euo pipefail
 umask 077
 
+# Long enough to notice a repair went wrong and go back to the original;
+# short enough that a copy of every secret does not sit there for years.
+RETAIN_DAYS=30
+
 check=0; auto=0
 case "${1:-}" in --check) check=1; shift ;; --auto) auto=1; shift ;; esac
 file="${1:-${XDG_DATA_HOME:-$HOME/.local/share}/keyrings/Default_keyring.keyring}"
+
+# Expired backups go whether or not this run repairs anything: the retention
+# is the point of running at every start. -mtime counts whole days, so a
+# backup is kept for at least RETAIN_DAYS of them.
+if [ "$check" -eq 0 ] && [ -d "$(dirname "$file")" ]; then
+  find "$(dirname "$file")" -maxdepth 1 -type f -name "$(basename "$file").before-repair-*" \
+    -mtime +"$RETAIN_DAYS" -delete 2>/dev/null || true
+fi
 
 say() { if [ "$auto" -eq 1 ]; then printf 'repair-keyring: %s\n' "$*" >&2; else printf 'repair-keyring: %s\n' "$*"; fi; }
 status() { [ "$auto" -eq 0 ] || echo "file=$1"; }
@@ -108,10 +126,13 @@ read -r left _ _ < <(scan stats "$tmp")
 
 backup="$file.before-repair-$(date +%Y%m%d-%H%M%S)"
 cp -p -- "$file" "$backup"
+# Whatever mode the keyring had, its copy is read by nobody else.
+chmod 600 -- "$backup"
 chmod --reference="$file" -- "$tmp"
 mv -f -- "$tmp" "$file"
 trap - EXIT
 say "joined them; the original is at $backup"
+say "that copy holds every secret in the keyring; it is removed after $RETAIN_DAYS days, or by Remove Plugin Data"
 
 # Each repaired envelope should open again. What it opens to goes to /dev/null.
 if command -v systemd-creds >/dev/null 2>&1; then

@@ -4,8 +4,10 @@
 Data** on the settings screen. Between them those clear everything this plugin
 put outside its own folder: the helper stops cleanly and takes its socket,
 FIFO and routing file with it, and the button clears the keyring entries, the
-learned suggestions, the exported public keys and the sign-ins of any accounts
-added beside the first. Both have to happen before
+learned suggestions, the exported public keys, the sign-ins of any accounts
+added beside the first, and any backup copy of the keyring file that the
+keyring repair left (`Default_keyring.keyring.before-repair-<time>`, a copy
+of every secret in that keyring, kept 30 days otherwise). Both have to happen before
 the next step, because `omarchy plugin remove` has no uninstall hook -- once
 the folder is gone there is no code left to run.
 
@@ -24,6 +26,10 @@ secret-tool clear service qs-bitwarden-cli
 
 # Learned window-title -> vault item suggestions
 rm -rf "${XDG_STATE_HOME:-$HOME/.local/state}/qs-bitwarden-cli"
+
+# Backups the keyring repair kept: the whole keyring file as it was, every
+# application's secrets included. Removed on their own after 30 days.
+rm -f "${XDG_DATA_HOME:-$HOME/.local/share}"/keyrings/Default_keyring.keyring.before-repair-*
 
 # Settings block: already gone. `omarchy plugin remove` takes the bar entry
 # and its settings with it. If a stale one is left -- from a plugin removed

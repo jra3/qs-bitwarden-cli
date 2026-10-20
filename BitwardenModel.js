@@ -1148,14 +1148,29 @@ function sessionHandoffReadCommand(expecting) {
 // does for 1Password.
 
 // Screen lock is polled: Omarchy's lock screen (ext-session-lock) never tells
-// logind, so only the shell's lock plugin knows, via IPC. Only "true" means
-// locked; a missing plugin must never read as locked.
+// logind. The shell's lock plugin knows about the locks it started, via IPC;
+// the compositor knows about every ext-session-lock, including a `hyprlock`
+// run by hand that never went through the lock plugin, and Omarchy's
+// `omarchy-hyprland-session-locked` reads that off `hyprctl` (exit 0 locked,
+// 1 unlocked, 2 undetermined). Either saying locked is locked. Only "true"
+// means locked; a missing plugin or detector must never read as locked, and
+// "undetermined" is a third answer: not a lock, but not a clear screen either.
 function screenLockStateCommand() {
-  return ["bash", "-c", "omarchy-shell lock isLocked 2>/dev/null | head -c 16"]
+  return ["bash", "-c", "__s=\"$(omarchy-shell lock isLocked 2>/dev/null | head -c 16 | tr -d '[:space:]')\"; "
+    + "if [ \"$__s\" = true ]; then echo true; exit 0; fi; "
+    + "omarchy-hyprland-session-locked >/dev/null 2>&1; "
+    + "case $? in 0) echo true ;; 2) echo undetermined ;; *) echo false ;; esac"]
 }
 
 function screenIsLocked(raw) {
   return String(raw || "").trim() === "true"
+}
+
+// The compositor could not be asked (no answer from `hyprctl`, or no monitor
+// with a workspace yet). Nothing to lock the vault over, but not a screen an
+// SSH prompt should be raised on either.
+function screenLockUndetermined(raw) {
+  return String(raw || "").trim() === "undetermined"
 }
 
 // Polled only while the setting is on and the vault unlocked (~50 ms per call).

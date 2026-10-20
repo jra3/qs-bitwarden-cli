@@ -8328,10 +8328,13 @@ Item {
   property double screenLockCheckedAt: 0
 
   function onScreenLockState(raw) {
-    root.screenIsLocked = Model.screenIsLocked(raw)
+    var locked = Model.screenIsLocked(raw)
+    // For the agent, an undetermined reading counts as locked: no prompt
+    // over a screen that may be locked. The vault locks only on a lock.
+    root.screenIsLocked = locked || Model.screenLockUndetermined(raw)
     root.screenLockCheckedAt = Date.now()
     if (!lockOnScreenLock || status !== "unlocked") return
-    if (root.screenIsLocked) lockVault()
+    if (locked) lockVault()
   }
 
   function onSleepSignal(line) {

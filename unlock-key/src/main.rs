@@ -1,19 +1,28 @@
 //! Command-line face of the quick-unlock envelope. See `lib.rs`.
 //!
 //! Run inside short shell pipelines between `secret-tool`, `systemd-creds`,
-//! `argon2` and `fido2-assert`. Secrets arrive in the environment, the
-//! envelope on stdin; the result (envelope, password, or secret-free summary)
-//! goes to stdout. No argument ever carries a secret, nor the account
-//! (/proc/<pid>/cmdline is world-readable).
+//! `argon2` and `fido2-assert`. Secrets arrive on a private file descriptor
+//! (`--secrets-fd N`), the account in the environment, the envelope on stdin;
+//! the result (envelope, password, or secret-free summary) goes to stdout. No
+//! argument ever carries a secret, nor the account (/proc/<pid>/cmdline is
+//! world-readable). No secret travels in the environment either:
+//! `/proc/<pid>/environ` is readable by every process running as the same
+//! user (and this one is dumpable until `harden_process()` runs), whereas a
+//! pipe is readable only by the processes holding it. The panel's shell opens
+//! it with `3< <(...)` from an unexported variable, so no other child of that
+//! shell ever sees the value.
 //!
 //! Environment:
 //!   QSBW_ACCOUNT_ID       create/open/add/rotate: the account's user id
 //!   QSBW_SERVER           the same: its server URL (may be empty)
+//!
+//! The descriptor carries `NAME=value` records, each ended by a NUL byte;
+//! an empty record ends the list early. Names:
 //!   QSBW_UNLOCK_PASSWORD  create: the password `bw` accepted
 //!                         rotate: the new password `bw` accepted
 //!   QSBW_UNLOCK_KEY       the key for --via / --auth: `argon2 -r` hex for
 //!                         master and pin, `fido2-assert` base64 for fido,
-//!                         unset for fingerprint
+//!                         absent for fingerprint
 //!   QSBW_UNLOCK_NEW_KEY   create/rotate: `argon2 -r` hex of the password
 //!                         add pin: `argon2 -r` hex of the PIN
 //!                         add fido: `fido2-assert` base64 hmac-secret
@@ -28,15 +37,23 @@ use qs_bitwarden_unlock_key::{
 };
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::os::unix::ffi::OsStringExt;
+use std::os::unix::io::FromRawFd;
 use zeroize::Zeroizing;
 
 const NAME: &str = "qs-bitwarden-unlock-key";
 const ACCOUNT_ID_ENV: &str = "QSBW_ACCOUNT_ID";
 const SERVER_ENV: &str = "QSBW_SERVER";
-const PASSWORD_ENV: &str = "QSBW_UNLOCK_PASSWORD";
-const KEY_ENV: &str = "QSBW_UNLOCK_KEY";
-const NEW_KEY_ENV: &str = "QSBW_UNLOCK_NEW_KEY";
+/// The command-line face, bumped when the panel's pipelines must change
+/// with it (the panel checks this in `--version`): 2 moved the account from
+/// the arguments to the environment, 3 the secrets from the environment to
+/// `--secrets-fd`.
+const CLI_VERSION: u8 = 3;
+const PASSWORD_SECRET: &str = "QSBW_UNLOCK_PASSWORD";
+const KEY_SECRET: &str = "QSBW_UNLOCK_KEY";
+const NEW_KEY_SECRET: &str = "QSBW_UNLOCK_NEW_KEY";
+/// The secrets descriptor holds a password and at most two keys; anything
+/// past this is not the panel.
+const MAX_SECRETS_BYTES: usize = 64 * 1024;
 
 const EXIT_USAGE: i32 = 2;
 
@@ -88,7 +105,7 @@ fn main() {
         }
         Some("--version") if args.len() == 1 => {
             println!(
-                "{NAME} {} (envelope v1) (cli v2)",
+                "{NAME} {} (envelope v1) (cli v{CLI_VERSION})",
                 env!("CARGO_PKG_VERSION")
             );
             0
@@ -132,34 +149,35 @@ fn finish(outcome: Outcome) -> i32 {
 
 fn run(command: &str, rest: &[String]) -> Outcome {
     let flags = Flags::parse(rest)?;
+    let secrets = Secrets::read(&flags)?;
     match command {
-        "create" => create(&flags),
-        "open" => open(&flags),
-        "add" => add(&flags),
+        "create" => create(&flags, &secrets),
+        "open" => open(&flags, &secrets),
+        "add" => add(&flags, &secrets),
         "remove" => remove(&flags),
-        "rotate" => rotate(&flags),
+        "rotate" => rotate(&flags, &secrets),
         "mark-stale" => mark_stale(&flags),
         "inspect" => inspect(&flags),
         _ => Err(Failure::Usage("unknown command; see --help")),
     }
 }
 
-fn create(flags: &Flags) -> Outcome {
-    flags.only(&["salt", "m", "t", "p"])?;
-    let password = secret_env(PASSWORD_ENV)?;
-    let master_key = hex_env(NEW_KEY_ENV)?;
+fn create(flags: &Flags, secrets: &Secrets) -> Outcome {
+    flags.only(&["salt", "m", "t", "p", "secrets-fd"])?;
+    let password = secrets.required(PASSWORD_SECRET)?;
+    let master_key = secrets.hex(NEW_KEY_SECRET)?;
     let envelope = Envelope::create(flags.account()?, &password, flags.argon2()?, &master_key)?;
     Ok(envelope.to_json()?)
 }
 
-fn open(flags: &Flags) -> Outcome {
-    flags.only(&["via", "cred"])?;
+fn open(flags: &Flags, secrets: &Secrets) -> Outcome {
+    flags.only(&["via", "cred", "secrets-fd"])?;
     let envelope = read_envelope(Some(&flags.account()?))?;
-    let key = ViaKey::from_env(flags.required("via")?, flags.optional("cred"))?;
+    let key = ViaKey::from_secrets(secrets, flags.required("via")?, flags.optional("cred"))?;
     Ok(envelope.open(&key.via())?)
 }
 
-fn add(flags: &Flags) -> Outcome {
+fn add(flags: &Flags, secrets: &Secrets) -> Outcome {
     flags.only(&[
         "auth",
         "auth-cred",
@@ -171,17 +189,22 @@ fn add(flags: &Flags) -> Outcome {
         "cred",
         "rp",
         "fido-salt",
+        "secrets-fd",
     ])?;
     let mut envelope = read_envelope(Some(&flags.account()?))?;
-    let auth = ViaKey::from_env(flags.required("auth")?, flags.optional("auth-cred"))?;
+    let auth = ViaKey::from_secrets(
+        secrets,
+        flags.required("auth")?,
+        flags.optional("auth-cred"),
+    )?;
     match flags.required("method")? {
         "pin" => {
-            let pin_key = hex_env(NEW_KEY_ENV)?;
+            let pin_key = secrets.hex(NEW_KEY_SECRET)?;
             envelope.add_pin(&auth.via(), flags.argon2()?, &pin_key)?;
         }
         "fingerprint" => envelope.add_fingerprint(&auth.via())?,
         "fido" => {
-            let hmac = base64_env(NEW_KEY_ENV)?;
+            let hmac = secrets.base64(NEW_KEY_SECRET)?;
             envelope.add_fido(
                 &auth.via(),
                 flags.required("cred")?,
@@ -210,12 +233,16 @@ fn remove(flags: &Flags) -> Outcome {
     Ok(envelope.to_json()?)
 }
 
-fn rotate(flags: &Flags) -> Outcome {
-    flags.only(&["auth", "auth-cred", "salt", "m", "t", "p"])?;
+fn rotate(flags: &Flags, secrets: &Secrets) -> Outcome {
+    flags.only(&["auth", "auth-cred", "salt", "m", "t", "p", "secrets-fd"])?;
     let mut envelope = read_envelope(Some(&flags.account()?))?;
-    let auth = ViaKey::from_env(flags.required("auth")?, flags.optional("auth-cred"))?;
-    let password = secret_env(PASSWORD_ENV)?;
-    let master_key = hex_env(NEW_KEY_ENV)?;
+    let auth = ViaKey::from_secrets(
+        secrets,
+        flags.required("auth")?,
+        flags.optional("auth-cred"),
+    )?;
+    let password = secrets.required(PASSWORD_SECRET)?;
+    let master_key = secrets.hex(NEW_KEY_SECRET)?;
     envelope.rotate(&auth.via(), &password, flags.argon2()?, &master_key)?;
     Ok(envelope.to_json()?)
 }
@@ -235,7 +262,7 @@ fn inspect(flags: &Flags) -> Outcome {
         .map_err(|_| Failure::Envelope(Error::Internal))
 }
 
-/// The key material for one --via / --auth, read from the environment.
+/// The key material for one --via / --auth, read from the secrets descriptor.
 struct ViaKey<'a> {
     kind: &'a str,
     credential: Option<&'a str>,
@@ -243,14 +270,18 @@ struct ViaKey<'a> {
 }
 
 impl<'a> ViaKey<'a> {
-    fn from_env(kind: &'a str, credential: Option<&'a str>) -> Result<Self, Failure> {
+    fn from_secrets(
+        secrets: &Secrets,
+        kind: &'a str,
+        credential: Option<&'a str>,
+    ) -> Result<Self, Failure> {
         let (key, credential) = match kind {
-            "master" | "pin" => (Some(hex_env(KEY_ENV)?), None),
+            "master" | "pin" => (Some(secrets.hex(KEY_SECRET)?), None),
             "fingerprint" => (None, None),
             "fido" => {
                 let credential =
                     credential.ok_or(Failure::Usage("fido needs the credential id"))?;
-                (Some(base64_env(KEY_ENV)?), Some(credential))
+                (Some(secrets.base64(KEY_SECRET)?), Some(credential))
             }
             _ => {
                 return Err(Failure::Usage(
@@ -356,13 +387,63 @@ fn read_envelope(account: Option<&Account>) -> Result<Envelope, Failure> {
     Ok(envelope)
 }
 
-fn secret_env(name: &str) -> Result<Zeroizing<Vec<u8>>, Failure> {
-    std::env::var_os(name)
-        .map(|value| Zeroizing::new(value.into_vec()))
-        .filter(|value| !value.is_empty())
-        .ok_or(Failure::Usage(
-            "a required secret is missing from the environment",
+/// What `--secrets-fd` carried: the records by name, read once before the
+/// command runs. Without the flag there are none, which every command that
+/// needs one reports as a usage error. The environment is never consulted.
+struct Secrets(Vec<(String, Zeroizing<Vec<u8>>)>);
+
+impl Secrets {
+    fn read(flags: &Flags) -> Result<Self, Failure> {
+        let Some(text) = flags.optional("secrets-fd") else {
+            return Ok(Self(Vec::new()));
+        };
+        // 0-2 are the pipeline's own streams; a secret on them would be the
+        // envelope or the output.
+        let fd: i32 = text
+            .parse()
+            .ok()
+            .filter(|fd| *fd >= 3)
+            .ok_or(Failure::Usage(
+                "--secrets-fd takes a descriptor number of 3 or more",
+            ))?;
+        // SAFETY: the descriptor is ours to read and close once; the shell
+        // opened it for this process alone (`3< <(...)`), and nothing else
+        // in this program holds it.
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let mut bytes = Zeroizing::new(Vec::new());
+        file.take(u64::try_from(MAX_SECRETS_BYTES + 1).unwrap_or(u64::MAX))
+            .read_to_end(&mut bytes)
+            .map_err(|_| Failure::Usage("the secrets descriptor could not be read"))?;
+        if bytes.len() > MAX_SECRETS_BYTES {
+            return Err(Failure::Envelope(Error::Policy));
+        }
+        parse_secrets(&bytes)
+    }
+
+    fn optional(&self, name: &str) -> Option<&Zeroizing<Vec<u8>>> {
+        self.0
+            .iter()
+            .find(|(n, v)| n == name && !v.is_empty())
+            .map(|(_, v)| v)
+    }
+
+    fn required(&self, name: &str) -> Result<Zeroizing<Vec<u8>>, Failure> {
+        self.optional(name).cloned().ok_or(Failure::Usage(
+            "a required secret is missing from the secrets descriptor",
         ))
+    }
+
+    fn hex(&self, name: &str) -> Result<Zeroizing<[u8; KEY_LEN]>, Failure> {
+        let text = self.required(name)?;
+        let text = std::str::from_utf8(&text).map_err(|_| Failure::Envelope(Error::Malformed))?;
+        Ok(key_from_hex(text)?)
+    }
+
+    fn base64(&self, name: &str) -> Result<Zeroizing<[u8; KEY_LEN]>, Failure> {
+        let text = self.required(name)?;
+        let text = std::str::from_utf8(&text).map_err(|_| Failure::Envelope(Error::Malformed))?;
+        Ok(key_from_base64(text)?)
+    }
 }
 
 /// A value that may be empty (a server URL), but must be set.
@@ -370,16 +451,32 @@ fn text_env(name: &str) -> Result<String, Failure> {
     std::env::var(name).map_err(|_| Failure::Usage("the account is missing from the environment"))
 }
 
-fn hex_env(name: &str) -> Result<Zeroizing<[u8; KEY_LEN]>, Failure> {
-    let text = secret_env(name)?;
-    let text = std::str::from_utf8(&text).map_err(|_| Failure::Envelope(Error::Malformed))?;
-    Ok(key_from_hex(text)?)
+/// `NAME=value` records ended by NUL, as the panel's shell writes them; an
+/// empty record ends the list. A record without `=`, or a name that is not
+/// an identifier, is malformed: the writer is not the panel.
+fn parse_secrets(bytes: &[u8]) -> Result<Secrets, Failure> {
+    let mut records = Vec::new();
+    for record in bytes.split(|b| *b == 0) {
+        if record.is_empty() {
+            break;
+        }
+        let cut = record
+            .iter()
+            .position(|b| *b == b'=')
+            .ok_or(Failure::Envelope(Error::Malformed))?;
+        let name = std::str::from_utf8(&record[..cut])
+            .ok()
+            .filter(|n| is_identifier(n))
+            .ok_or(Failure::Envelope(Error::Malformed))?;
+        records.push((name.to_owned(), Zeroizing::new(record[cut + 1..].to_vec())));
+    }
+    Ok(Secrets(records))
 }
 
-fn base64_env(name: &str) -> Result<Zeroizing<[u8; KEY_LEN]>, Failure> {
-    let text = secret_env(name)?;
-    let text = std::str::from_utf8(&text).map_err(|_| Failure::Envelope(Error::Malformed))?;
-    Ok(key_from_base64(text)?)
+fn is_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
 /// One named self-test check.
@@ -388,7 +485,7 @@ type Check = (&'static str, fn() -> bool);
 /// Run before the panel trusts this binary: hardening applies, the cipher
 /// round-trips, wrong keys and edits are refused. Random keys; no system I/O.
 fn self_test() -> i32 {
-    let checks: [Check; 4] = [
+    let checks: [Check; 5] = [
         (
             "process hardening (RLIMIT_CORE=0, PR_SET_DUMPABLE=0)",
             || harden_process().is_ok(),
@@ -398,6 +495,10 @@ fn self_test() -> i32 {
         (
             "key material decodes from argon2 and fido2-assert output",
             decoding,
+        ),
+        (
+            "secrets arrive as NUL-ended records, and never from the environment",
+            secret_records,
         ),
     ];
     let mut failed = 0;
@@ -493,6 +594,27 @@ fn refusals() -> bool {
     wrong && edited
 }
 
+fn secret_records() -> bool {
+    let block = b"QSBW_UNLOCK_KEY=0011\0QSBW_UNLOCK_PASSWORD=pw\n\0\0ignored=after-end\0";
+    let parsed = match parse_secrets(block) {
+        Ok(secrets) => secrets,
+        Err(_) => return false,
+    };
+    let right = parsed
+        .optional("QSBW_UNLOCK_KEY")
+        .is_some_and(|v| v.as_slice() == b"0011")
+        && parsed
+            .optional("QSBW_UNLOCK_PASSWORD")
+            .is_some_and(|v| v.as_slice() == b"pw\n")
+        && parsed.optional("ignored").is_none();
+    let refused = parse_secrets(b"no-equals\0").is_err() && parse_secrets(b"1x=y\0").is_err();
+    // A secret set in this process's own environment must not be read.
+    std::env::set_var("QSBW_UNLOCK_KEY", "ff".repeat(KEY_LEN));
+    let ignored = Secrets(Vec::new()).hex("QSBW_UNLOCK_KEY").is_err();
+    std::env::remove_var("QSBW_UNLOCK_KEY");
+    right && refused && ignored
+}
+
 fn decoding() -> bool {
     key_from_hex(&"ab".repeat(KEY_LEN)).is_ok_and(|k| k.iter().all(|b| *b == 0xab))
         && key_from_base64(TEST_FIDO_SALT).is_ok_and(|k| k[31] == 31)
@@ -504,17 +626,18 @@ fn print_help() {
         "{NAME} <command> [--flag value]...
 
 The master password encrypted once, for the Bitwarden panel's quick unlock.
-Secrets and the account (QSBW_ACCOUNT_ID, QSBW_SERVER; create, open, add and
-rotate) come only from the environment; the envelope comes on stdin.
+Secrets come only on the descriptor --secrets-fd names, as NUL-ended
+NAME=value records; the account (QSBW_ACCOUNT_ID, QSBW_SERVER; create, open,
+add and rotate) only from the environment; the envelope on stdin.
 
-  create      --salt --m --t --p
-  open        --via master|pin|fingerprint|fido [--cred]
+  create      --salt --m --t --p --secrets-fd
+  open        --via master|pin|fingerprint|fido [--cred] [--secrets-fd]
   add         --auth <method> [--auth-cred] --method pin
-                  --salt --m --t --p
-              ... --method fingerprint
-              ... --method fido --cred --rp --fido-salt
+                  --salt --m --t --p --secrets-fd
+              ... --method fingerprint [--secrets-fd]
+              ... --method fido --cred --rp --fido-salt --secrets-fd
   remove      --method pin|fingerprint|fido [--cred]
-  rotate      --auth <method> [--auth-cred] --salt --m --t --p
+  rotate      --auth <method> [--auth-cred] --salt --m --t --p --secrets-fd
   mark-stale
   inspect
   --version | --self-test | --help"

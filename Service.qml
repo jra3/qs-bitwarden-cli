@@ -1819,7 +1819,11 @@ Item {
         if ((code === 0 && root.envelopeSummary) || code === Model.envelopeExitCodes().absent) {
           root.reconcileDisabledMethods()
         }
-        if (code === 0 && root.envelopeSummary && root.reconcileMasterOnlyEnvelope()) return
+        // A purge that failed for another account is retried even once this
+        // one's envelope is gone.
+        if (((code === 0 && root.envelopeSummary)
+             || (code === Model.envelopeExitCodes().absent && root.envelopePurgeFailed))
+            && root.reconcileMasterOnlyEnvelope()) return
         root.recomputeFingerprintStored()
         root.recomputePinConfigured()
         // A switched-to account's methods are known only now.
@@ -1848,14 +1852,24 @@ Item {
     return true
   }
 
-  // Removes this account's envelope from the keyring, whatever it holds;
-  // the summary follows. `storeMasterPassword` off, or nothing left to use
-  // it (reconcileMasterOnlyEnvelope()).
+  // Removes every account's envelope from the keyring, whatever it holds;
+  // the summary follows once that worked. `storeMasterPassword` off, or no
+  // method left to use it (reconcileMasterOnlyEnvelope()): both settings are
+  // shared, so no account should keep one.
+  property bool envelopePurgeFailed: false
+
   function purgeUnwantedEnvelope() {
     queueEnvelopeJob({
-      command: Model.unlockEnvelopeClearCommand(activeSlot), writes: true,
+      command: Model.unlockEnvelopeClearCommand(accountSlotsForPurge()), writes: true,
       onDone: function(code) {
-        root.envelopeSummary = null
+        root.envelopePurgeFailed = code !== 0
+        if (code === 0) {
+          root.envelopeSummary = null
+          if (root.errorMessage.indexOf("Could not remove the stored master password") === 0) root.errorMessage = ""
+        } else {
+          root.errorMessage = "Could not remove the stored master password from the OS keyring. Check the keyring service; the next check retries."
+          console.warn("qs-bitwarden envelope: removing the stored master password failed (" + code + ")")
+        }
         root.envelopeChecked = true
         root.recomputeFingerprintStored()
         root.recomputePinConfigured()

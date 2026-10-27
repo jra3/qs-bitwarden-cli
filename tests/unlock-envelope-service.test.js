@@ -149,6 +149,9 @@ check("an envelope found with no method in it and none turned on is removed, not
     && /quickUnlockEnableGraceMs\) return false/.test(bodyOf("reconcileMasterOnlyEnvelope"))
     && /purgeUnwantedEnvelope\(\)/.test(bodyOf("reconcileMasterOnlyEnvelope"))
     && /root\.reconcileMasterOnlyEnvelope\(\)\) return/.test(bodyOf("refreshEnvelope")), bodyOf("reconcileMasterOnlyEnvelope"))
+check("a purge that failed for another account is retried once the active envelope is gone",
+  /code === Model\.envelopeExitCodes\(\)\.absent && root\.envelopePurgeFailed\)\)\s*&& root\.reconcileMasterOnlyEnvelope\(\)\) return/.test(bodyOf("refreshEnvelope"))
+    && /root\.envelopePurgeFailed = code !== 0/.test(bodyOf("purgeUnwantedEnvelope")), bodyOf("refreshEnvelope"))
 check("storeMasterPassword: false in shell.json turns quick unlock off and removes a stored envelope",
   /readonly property bool storeMasterPassword: setting\("storeMasterPassword", true\) !== false/.test(service)
     && /readonly property bool quickUnlockAvailable: unlockKeyReady && quickUnlockPrereqs\.ready && storeMasterPassword/.test(service)
@@ -156,9 +159,12 @@ check("storeMasterPassword: false in shell.json turns quick unlock off and remov
     && /storeMasterPassword/.test(Model.storeMasterPasswordOffReason()), "")
 check("it is not in the settings screen",
   !/storeMasterPassword/.test(read("BitwardenModel.js").split("SETTINGS_SCHEMA")[1] || ""), "")
-check("the purge clears only the account's envelope entry",
-  /keyringClearEntryCommand\(keyringEntryName\(KEYRING_ENVELOPE, slot\)\)/.test(read("BitwardenModel.js").match(/function unlockEnvelopeClearCommand[\s\S]*?\n\}/)[0])
-    && /Model\.unlockEnvelopeClearCommand\(activeSlot\), writes: true/.test(bodyOf("purgeUnwantedEnvelope")), "")
+check("the purge clears the envelope entry of every account",
+  /keyringClearCheckedScript\(keyringEntryName\(KEYRING_ENVELOPE, list\[i\]\)\)/.test(read("BitwardenModel.js").match(/function unlockEnvelopeClearCommand[\s\S]*?\n\}/)[0])
+    && /Model\.unlockEnvelopeClearCommand\(accountSlotsForPurge\(\)\), writes: true/.test(bodyOf("purgeUnwantedEnvelope")), "")
+check("a failed purge keeps the summary and says so",
+  /if \(code === 0\) \{\s*root\.envelopeSummary = null/.test(bodyOf("purgeUnwantedEnvelope"))
+    && /\} else \{\s*root\.errorMessage = "Could not remove the stored master password/.test(bodyOf("purgeUnwantedEnvelope")), bodyOf("purgeUnwantedEnvelope"))
 // --- a weaker method beside the key -----------------------------------------
 check("adding a fingerprint or PIN wrap beside a FIDO2 wrap warns and needs a second press",
   /if \(fpDowngradeWarning && !fpDowngradeConfirmed\) \{\s*fpDowngradeConfirmed = true\s*fpError = Model\.downgradeConfirmText/.test(bodyOf("submitFingerprintSetup"))

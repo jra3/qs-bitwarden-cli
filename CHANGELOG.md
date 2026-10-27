@@ -106,7 +106,7 @@
   encrypted, even with every quick-unlock method off, and nothing removed it:
   an offline guessing target nobody had asked for. It is now written only
   while a quick-unlock method is turned on (or being turned on), one left
-  with no method is removed at the next start, and `storeMasterPassword:
+  with no method is removed at the next start, every account's alike, and `storeMasterPassword:
   false` in `shell.json` never writes it at all.
 
 ### Changed

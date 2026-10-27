@@ -2337,8 +2337,13 @@ function envelopeNewKey(secretExpr, saltVar) {
 
 // Removes the account's envelope entry: `storeMasterPassword` is off, or no
 // method is on to use it. Nothing else of the account's is touched.
-function unlockEnvelopeClearCommand(slot) {
-  return keyringClearEntryCommand(keyringEntryName(KEYRING_ENVELOPE, slot))
+// Removes the envelope of every account in `slots`. Exit 0 when none is left
+// (none there counts), 1 when a clear failed.
+function unlockEnvelopeClearCommand(slots) {
+  var script = "rc=0; "
+  var list = uniqueAccountSlots(slots)
+  for (var i = 0; i < list.length; i++) script += keyringClearCheckedScript(keyringEntryName(KEYRING_ENVELOPE, list[i]))
+  return ["bash", "-c", script + "exit \"$rc\""]
 }
 
 // Secret-free summary: enabled methods, staleness, FIDO2 credentials and
@@ -2593,6 +2598,17 @@ function quickUnlockPurgeCommand(tool, slots, method) {
   if (typeof tool !== "string" || tool.charAt(0) !== "/" || !LEGACY_ENTRY_FOR_METHOD[method]) {
     return envelopeRefused()
   }
+  var list = uniqueAccountSlots(slots)
+  var script = "rc=0; "
+  for (var j = 0; j < list.length; j++) {
+    script += nestedScript(envelopeMethodPurgeScript(tool, list[j], method)) + " || rc=1; "
+      + keyringClearCheckedScript(keyringEntryName(LEGACY_ENTRY_FOR_METHOD[method], list[j]))
+  }
+  script += "exit \"$rc\""
+  return ["bash", "-c", script]
+}
+
+function uniqueAccountSlots(slots) {
   var seen = {}
   var list = []
   for (var i = 0; slots && i < slots.length; i++) {
@@ -2601,17 +2617,16 @@ function quickUnlockPurgeCommand(tool, slots, method) {
     seen[slot] = true
     list.push(slot)
   }
-  var script = "rc=0; "
-  for (var j = 0; j < list.length; j++) {
-    script += nestedScript(envelopeMethodPurgeScript(tool, list[j], method)) + " || rc=1; "
-      // libsecret's clear returns 1 without stderr when no matching item
-      // exists; service failures also return 1, with an error on stderr.
-      + "__clear_error=$(secret-tool clear" + keyringAttributes(keyringEntryName(LEGACY_ENTRY_FOR_METHOD[method], list[j]))
-      + " 2>&1 >/dev/null; __status=$?; printf '.'; exit \"$__status\"); __clear_rc=$?; __clear_error=\"${__clear_error%.}\"; "
-      + "if [ \"$__clear_rc\" -ne 0 ] && { [ \"$__clear_rc\" -ne 1 ] || [ -n \"$__clear_error\" ]; }; then rc=1; fi; "
-  }
-  script += "exit \"$rc\""
-  return ["bash", "-c", script]
+  return list
+}
+
+// Clears one keyring entry and sets rc=1 if that failed. libsecret's clear
+// returns 1 without stderr when no matching item exists; service failures
+// also return 1, with an error on stderr.
+function keyringClearCheckedScript(account) {
+  return "__clear_error=$(secret-tool clear" + keyringAttributes(account)
+    + " 2>&1 >/dev/null; __status=$?; printf '.'; exit \"$__status\"); __clear_rc=$?; __clear_error=\"${__clear_error%.}\"; "
+    + "if [ \"$__clear_rc\" -ne 0 ] && { [ \"$__clear_rc\" -ne 1 ] || [ -n \"$__clear_error\" ]; }; then rc=1; fi; "
 }
 
 // Checks a typed master password against the stored one, printing nothing:

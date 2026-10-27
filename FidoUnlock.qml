@@ -523,6 +523,7 @@ Item {
     vault.requestPinentry("fidoPin", "", function(r) {
       if (r.state !== "ok" || !setupActive || !busy) {
         if (r.state === "ok") vault.forgetVaultSecret(r.name)
+        vault.forgetHeldPassword(typed)
         typed = ""
         busy = false
         message = ""

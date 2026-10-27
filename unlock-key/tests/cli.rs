@@ -1,12 +1,15 @@
 //! `qs-bitwarden-unlock-key` driven as the panel's pipelines drive it: secrets
-//! in the environment, envelope on stdin, result on stdout, exit status as the
-//! verdict. Key material is fixed text in `argon2`/`fido2-assert` formats, so
-//! neither tool is needed.
+//! on a descriptor the shell opens (`--secrets-fd 3 3< <(...)`), envelope on
+//! stdin, result on stdout, exit status as the verdict. Key material is fixed
+//! text in `argon2`/`fido2-assert` formats, so neither tool is needed.
 
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const BIN: &str = env!("CARGO_BIN_EXE_qs-bitwarden-unlock-key");
+/// The descriptor the panel's shell opens for the tool.
+const SECRETS_FD: &str = "3";
 /// The account reaches the tool in the environment, never as arguments.
 const ACCOUNT_ENV: [(&str, &str); 2] = [
     ("QSBW_ACCOUNT_ID", "user-1"),
@@ -47,9 +50,46 @@ fn hmac(byte: u8) -> String {
     Base64::encode_string(&[byte; 32])
 }
 
-fn run(args: &[&str], env: &[(&str, &str)], stdin: &[u8]) -> Output {
-    let mut child = Command::new(BIN)
-        .args(args)
+/// The records the panel's shell writes: `NAME=value` ended by NUL.
+fn block(secrets: &[(&str, &str)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (name, value) in secrets {
+        out.extend_from_slice(name.as_bytes());
+        out.push(b'=');
+        out.extend_from_slice(value.as_bytes());
+        out.push(0);
+    }
+    out
+}
+
+static FILES: AtomicUsize = AtomicUsize::new(0);
+
+/// Runs the tool as the pipelines do: the secrets block on descriptor 3,
+/// opened by a shell from a file here (the panel uses a process
+/// substitution, which is the same descriptor from the tool's side), and
+/// `--secrets-fd 3` appended whenever there is a block. The environment is
+/// empty, so a secret read from it would be a test failure, not a pass.
+fn run(args: &[&str], secrets: &[(&str, &str)], stdin: &[u8]) -> Output {
+    run_with(args, secrets, &[], stdin)
+}
+
+fn run_with(args: &[&str], secrets: &[(&str, &str)], env: &[(&str, &str)], stdin: &[u8]) -> Output {
+    let n = FILES.fetch_add(1, Ordering::Relaxed);
+    let file = std::env::temp_dir().join(format!(
+        "qsbw-unlock-key-test-{}-{n}.secrets",
+        std::process::id()
+    ));
+    std::fs::write(&file, block(secrets)).unwrap();
+    let mut argv: Vec<&str> = args.to_vec();
+    if !secrets.is_empty() {
+        argv.extend_from_slice(&["--secrets-fd", SECRETS_FD]);
+    }
+    let mut child = Command::new("bash")
+        .arg("-c")
+        .arg(format!("exec \"$1\" \"${{@:2}}\" {SECRETS_FD}<\"$0\""))
+        .arg(&file)
+        .arg(BIN)
+        .args(&argv)
         .env_clear()
         .envs(ACCOUNT_ENV)
         .envs(env.iter().copied())
@@ -61,7 +101,9 @@ fn run(args: &[&str], env: &[(&str, &str)], stdin: &[u8]) -> Output {
     // A command that refuses its flags exits before reading stdin; a broken
     // pipe then is expected, not a failure.
     let _ = child.stdin.take().unwrap().write_all(stdin);
-    child.wait_with_output().unwrap()
+    let output = child.wait_with_output().unwrap();
+    let _ = std::fs::remove_file(&file);
+    output
 }
 
 fn ok(args: &[&str], env: &[(&str, &str)], stdin: &[u8]) -> Vec<u8> {
@@ -252,11 +294,13 @@ fn exit_codes_say_what_went_wrong() {
     // 6: another account.
     let other = ["open", "--via", "master"];
     let key = hex(1);
-    let env = [
-        ("QSBW_UNLOCK_KEY", key.as_str()),
-        ("QSBW_ACCOUNT_ID", "user-2"),
-    ];
-    assert_eq!(code(&other, &env, &envelope), 6);
+    let output = run_with(
+        &other,
+        &[("QSBW_UNLOCK_KEY", key.as_str())],
+        &[("QSBW_ACCOUNT_ID", "user-2")],
+        &envelope,
+    );
+    assert_eq!(output.status.code(), Some(6));
     // 7: a method that is not there.
     let bare = created();
     assert_eq!(
@@ -290,29 +334,90 @@ fn usage_errors_are_refused_before_anything_runs() {
     ] {
         assert_eq!(code(&args, &[], &envelope), 2, "{args:?}");
     }
-    // A required secret missing from the environment.
+    // A required secret missing from the descriptor.
     let args = with(&[&["create"], &MASTER_KDF]);
     assert_eq!(
         code(&refs(&args), &[("QSBW_UNLOCK_NEW_KEY", &hex(1))], b""),
         2
     );
     assert_eq!(code(&[], &[], b""), 2);
+    // The pipeline's own streams cannot be the secrets descriptor.
+    for fd in ["0", "1", "2", "-1", "three"] {
+        let args = with(&[&["create"], &MASTER_KDF, &["--secrets-fd", fd]]);
+        assert_eq!(
+            run_with(&refs(&args), &[], &[], b"").status.code(),
+            Some(2),
+            "fd {fd}"
+        );
+    }
+}
+
+/// `/proc/<pid>/environ` is readable by every process of the same user, so
+/// the tool must not take a secret from there even when one is offered.
+#[test]
+fn secrets_in_the_environment_are_ignored() {
+    let envelope = created();
+    let args = with(&[&["open"], &["--via", "master"]]);
+    let output = run_with(
+        &refs(&args),
+        &[],
+        &[("QSBW_UNLOCK_KEY", &hex(1))],
+        &envelope,
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    // And a descriptor beats the environment, even a wrong one there.
+    let output = run_with(
+        &refs(&args),
+        &[("QSBW_UNLOCK_KEY", &hex(1))],
+        &[("QSBW_UNLOCK_KEY", &hex(9))],
+        &envelope,
+    );
+    assert_eq!(output.stdout, b"correct horse");
+}
+
+/// The records are bytes: a password with a newline or a quote in it, or an
+/// extra record the tool does not know, must not change the outcome.
+#[test]
+fn awkward_secrets_survive_the_descriptor() {
+    let password = "it's \"quoted\" $and \\ spans\nlines\n";
+    let args = with(&[&["create"], &MASTER_KDF]);
+    let envelope = ok(
+        &refs(&args),
+        &[
+            ("QSBW_UNLOCK_PASSWORD", password),
+            ("UNRELATED", "x=y"),
+            ("QSBW_UNLOCK_NEW_KEY", &hex(1)),
+        ],
+        b"",
+    );
+    assert_eq!(
+        open(&envelope, &["--via", "master"], Some(&hex(1))).stdout,
+        password.as_bytes()
+    );
 }
 
 #[test]
 fn the_account_is_required_in_the_environment() {
     let envelope = created();
     let key = hex(1);
-    for missing in ["QSBW_ACCOUNT_ID", "QSBW_SERVER"] {
+    // With the whole account there the same run opens, so the refusals below
+    // are the missing variable's, not the secret's.
+    for missing in [None, Some("QSBW_ACCOUNT_ID"), Some("QSBW_SERVER")] {
         let env: Vec<(&str, &str)> = ACCOUNT_ENV
             .iter()
             .copied()
-            .filter(|(name, _)| *name != missing)
-            .chain([("QSBW_UNLOCK_KEY", key.as_str())])
+            .filter(|(name, _)| Some(*name) != missing)
             .collect();
-        let mut child = Command::new(BIN)
-            .args(["open", "--via", "master"])
+        let mut child = Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "exec \"$1\" open --via master --secrets-fd {SECRETS_FD} {SECRETS_FD}< <(printf 'QSBW_UNLOCK_KEY=%s\\0' \"$0\")"
+            ))
+            .arg(&key)
+            .arg(BIN)
             .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .envs(env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -321,7 +426,8 @@ fn the_account_is_required_in_the_environment() {
             .unwrap();
         let _ = child.stdin.take().unwrap().write_all(&envelope);
         let output = child.wait_with_output().unwrap();
-        assert_eq!(output.status.code(), Some(2), "{missing} missing");
+        let want = if missing.is_some() { 2 } else { 0 };
+        assert_eq!(output.status.code(), Some(want), "{missing:?} missing");
     }
 }
 
@@ -401,13 +507,11 @@ fn a_wrong_password_cannot_authorize_a_new_method() {
 #[test]
 fn version_and_self_test_answer_without_input() {
     let version = ok(&["--version"], &[], b"");
-    assert!(String::from_utf8(version)
-        .unwrap()
-        .starts_with("qs-bitwarden-unlock-key "));
-    // The panel refuses a tool that does not report this contract version.
-    assert!(String::from_utf8(ok(&["--version"], &[], b""))
-        .unwrap()
-        .contains("(cli v2)"));
+    let version = String::from_utf8(version).unwrap();
+    assert!(version.starts_with("qs-bitwarden-unlock-key "));
+    // The panel reads the contract version here and refuses a binary whose
+    // pipelines it does not speak.
+    assert!(version.contains("(cli v3)"), "{version}");
     let output = run(&["--self-test"], &[], b"");
     assert_eq!(
         output.status.code(),

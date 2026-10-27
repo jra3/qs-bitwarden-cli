@@ -87,12 +87,12 @@ Column {
   }
 
   // Arms the offered presence method; every path that shows the form comes
-  // through here.
+  // through here. Not the FIDO2 key: a request left on it is answered by the
+  // next touch, whatever that touch was for, so the key waits for the button.
   function armOfferedMethod() {
     if (!visible || !fieldsOffered || form.vault.status !== "locked") return
     if (form.vault.isUnlocking) return
-    if (method === "fido") form.vault.startFidoUnlock()
-    else if (method === "fingerprint") form.vault.startFingerprintUnlock()
+    if (method === "fingerprint") form.vault.startFingerprintUnlock()
     // A default PIN or password method: open pinentry, once per showing.
     else if (form.pinentryOffered && !form.vault.pinentryAutoAsked && !form.vault.pinentryActive) {
       form.vault.pinentryAutoAsked = true
@@ -333,6 +333,18 @@ Column {
     focusable: form.buttonsFocusable
     enabled: !form.vault.isUnlocking && !form.vault.fidoScanning
     onClicked: form.vault.startFidoUnlock()
+  }
+
+  // The key is asked for a touch only by that button.
+  Text {
+    textFormat: Text.PlainText
+    visible: form.fieldsOffered && form.method === "fido" && !form.fidoBusy && form.vault.fidoError === ""
+    width: parent.width
+    text: "Nothing is asked of the key until you press this; then touch it once."
+    color: form.panel.dim
+    font.family: form.panel.fontFamily
+    font.pixelSize: Style.font.caption
+    wrapMode: Text.WordWrap
   }
 
   Column {

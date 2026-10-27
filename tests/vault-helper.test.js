@@ -24,8 +24,23 @@ const body = name => functionBody(service, name)
 const line = JSON.parse(Model.vaultExecLine(4, ["bw", "status"], { A: 1, B: null }, { BW_SESSION: "session" }, "session", "in"))
 eq("an exec request carries the run, strings only in env",
   JSON.stringify(line),
-  JSON.stringify({ type: "exec", v: 1, id: 4, argv: ["bw", "status"], env: { A: "1", B: null },
+  JSON.stringify({ type: "exec", v: 2, id: 4, argv: ["bw", "status"], env: { A: "1", B: null },
     inject: { BW_SESSION: "session" }, capture: "session", stdin: "in" }))
+// Secrets go beside the environment, to the run's stdin: present when given
+// (even empty, so a script's reader never waits), absent otherwise.
+const withSecrets = JSON.parse(Model.vaultExecLine(5, ["bash"], {}, {}, "plain", "", { QSBW_SECRET: "pw", N: null }, { QSBW_PIN: "secret:pw3" }))
+eq("secrets and held secrets ride beside env and inject",
+  JSON.stringify([withSecrets.secrets, withSecrets.heldSecrets, "stdin" in withSecrets]),
+  JSON.stringify([{ QSBW_SECRET: "pw", N: "" }, { QSBW_PIN: "secret:pw3" }, false]))
+eq("an empty secrets map is still sent", JSON.stringify(JSON.parse(Model.vaultExecLine(6, ["bash"], {}, {}, "plain", "", {})).secrets), "{}")
+check("none given means none sent", !("secrets" in line) && !("heldSecrets" in line), JSON.stringify(line))
+const startBody = body("vaultStart")
+check("the panel splits held references out of secrets as it does for the environment",
+  /heldSecrets\[name\] = "secret:" \+ heldSecret/.test(startBody) && /secrets\[name\] = proc\.secrets\[name\]/.test(startBody)
+    && /Model\.vaultExecLine\(id, proc\.command, environment, inject, proc\.capture, proc\.stdinText,\s*secrets, heldSecrets\)/.test(startBody), startBody)
+check("falling back, the panel writes the same block to stdin itself",
+  /Model\.secretBlock\(vaultLocalEnv\(secrets, heldSecrets\)\)/.test(startBody)
+    && /proc\.runLocally\(vaultLocalEnv\(environment, inject\), input \+ proc\.stdinText\)/.test(startBody), startBody)
 eq("a reply line parses, anything else is null",
   [Model.parseVaultHelperLine('{"type":"ready"}').type, Model.parseVaultHelperLine("nope"), Model.parseVaultHelperLine("3")].join(),
   "ready,,")
@@ -242,7 +257,14 @@ if (!fs.existsSync(binary)) {
 } else {
   const inspection = require("child_process").execFileSync(...(c => [c[0], c.slice(1)])(Model.vaultHelperInspectCommand(repoRoot))).toString()
   const parsed = Model.parseVaultHelperInspection(inspection)
-  eq("the panel's inspection accepts the built helper", parsed.state + "/" + parsed.protocol, "ok/1")
+  // The tracked binary under bin/ is used first when it is there; one built
+  // before protocol 2 is reported as a mismatch (and must be rebuilt), which
+  // is the right answer, not a pass.
+  const bundledVault = path.join(repoRoot, "bin/x86_64-linux/qs-bitwarden-vault")
+  const bundledStale = fs.existsSync(bundledVault)
+    && !/protocol 2\b/.test(require("child_process").spawnSync(bundledVault, ["--version"], { encoding: "utf8" }).stdout || "")
+  eq(bundledStale ? "the panel's inspection refuses the stale tracked helper (bin/ must be rebuilt)" : "the panel's inspection accepts the built helper",
+    parsed.state + "/" + parsed.protocol, bundledStale ? "protocol-mismatch/1" : "ok/2")
 
   const child = spawn(binary, [], { stdio: ["pipe", "pipe", "inherit"] })
   let buffer = ""
@@ -269,7 +291,7 @@ if (!fs.existsSync(binary)) {
 
   ;(async () => {
     send(Model.vaultHelperLine("hello", {}))
-    eq("the helper answers the panel's hello", (await reply(m => m.type === "ready")).protocol, 1)
+    eq("the helper answers the panel's hello", (await reply(m => m.type === "ready")).protocol, 2)
 
     // TOTP: the helper's codes match TotpModel.js, quirks included.
     const keys = [

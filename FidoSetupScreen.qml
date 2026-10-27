@@ -45,10 +45,21 @@ Column {
     Text {
       textFormat: Text.PlainText
       width: parent.width
-      text: "Your master password is already stored encrypted and sealed to this machine. A touch asks the key for a secret only it can produce, and enabling this lets that secret open the password, so unlocking needs the key itself."
+      text: "Your master password is already stored encrypted and sealed to this machine. A touch asks the key for a secret only it can produce, and enabling this lets that secret open the password, so unlocking needs the key itself. A registration that asks for the key's PIN keeps asking for it here, typed into pinentry, and the key then answers with a secret a touch alone never yields."
       color: panel.dim
       font.family: panel.fontFamily
       font.pixelSize: Style.font.bodySmall
+      wrapMode: Text.WordWrap
+    }
+
+    Text {
+      textFormat: Text.PlainText
+      visible: vault.fidoDowngradeWarning !== ""
+      width: parent.width
+      text: "󰀪  " + vault.fidoDowngradeWarning
+      color: Color.urgent
+      font.family: panel.fontFamily
+      font.pixelSize: Style.font.caption
       wrapMode: Text.WordWrap
     }
   }

@@ -468,8 +468,9 @@ check("confirm is optional when omitted", Model.validatePin("123456") === "", Mo
 const store = legacyKeyring(Model).storePin()[2]
 
 const unlock = Model.pinUnlockCommand()[2]
-check("unlock decrypts with the PIN-derived key",
-  unlock.includes("openssl enc -d") && unlock.includes("env:QSBW_PIN"), unlock)
+check("unlock decrypts with the PIN-derived key, the PIN from stdin and on a descriptor, never the environment",
+  unlock.includes("openssl enc -d") && unlock.includes("-pass fd:3") && unlock.includes("3< <(printf '%s' \"$QSBW_PIN\")")
+    && !unlock.includes("env:QSBW_PIN") && unlock.indexOf(Model.secretsPreamble()) !== -1, unlock)
 check("unlock fails loudly when the lookup fails (pipefail)",
   unlock.includes("set -o pipefail"), unlock)
 check("unlock iteration count matches store",

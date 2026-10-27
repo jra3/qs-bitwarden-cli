@@ -261,7 +261,7 @@ function driveHelper(requests) {
 }
 
 async function throughHelper() {
-  const request = (id, argv, extra) => JSON.stringify(Object.assign({ type: "exec", v: 1, id, argv, env: {}, inject: {} }, extra))
+  const request = (id, argv, extra) => JSON.stringify(Object.assign({ type: "exec", v: 2, id, argv, env: {}, inject: {} }, extra))
   fs.writeFileSync(answers, "pin:p%25w%0Ad+\ncancel\n")
   const ask = Model.pinentryCommand(fake, { title: "Bitwarden", prompt: "PIN:" })
   const show = ["bash", "-c", "printf '%s' \"$PW\""]

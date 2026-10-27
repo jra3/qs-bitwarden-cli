@@ -76,6 +76,61 @@ output is handed back as it is, except:
 - a password or PIN typed into pinentry (below) is kept, and the shell gets
   only whether there was an answer.
 
+## Where the secrets of quick unlock travel
+
+The pipelines that check, store and open the quick-unlock envelope (see the
+README's [How quick unlock stores your password](../README.md#how-quick-unlock-stores-your-password))
+run as `bash` scripts under the helper, between `secret-tool`, `systemd-creds`,
+`argon2`, `jq`, `fido2-assert` and the unlock tool. Three values pass through
+them that are worth more than the session key: the master password you typed
+(while it is checked against the stored copy, or stored), the unlock PIN, and
+the FIDO2 key's `hmac-secret`, which opens the key's way in and would do so
+again from any program that held it. None of them is ever in a process's
+environment or arguments. Linux lets every process running as you read
+another's `/proc/<pid>/environ` for as long as it runs, and a value in the
+shell's environment is inherited by every child, so an older build left the
+hmac-secret readable in `jq`, `head` and `secret-tool` for the length of an
+unlock.
+
+The route is:
+
+1. The panel hands the value to the helper as a `secrets` entry of the run
+   (by value, or by the name of a value the helper already holds, such as a
+   password typed into pinentry). It never goes in the run's `env`.
+2. The helper writes it to the run's stdin, ahead of anything else, as
+   `NAME=value` records ended by a NUL byte and closed by an empty record.
+3. The script's first statement reads those records into plain shell
+   variables, once, and stops at the empty record. They are never
+   `export`ed, so no process the script starts has them in its environment,
+   and the script's own environment never held them. A step nested in another
+   script runs as a subshell, which sees the variables and still has no
+   environment with them in.
+4. The one program that must have a value, the unlock tool, gets it on a
+   descriptor of its own: `--secrets-fd 3 3< <(...)`, a pipe written by the
+   shell's builtin `printf`, which only the tool and the shell ever hold. The
+   tool reads nothing from its environment. `argon2` reads the password or
+   PIN on its stdin the same way; `openssl`, for a PIN blob from an older
+   version, on a descriptor (`-pass fd:3`); and when `bw` has to check a
+   typed password itself, it reads a pipe as its `--passwordfile`, as the
+   unlock's FIFO is.
+5. The FIDO2 key's PIN, for a registration that asks for one, is typed into
+   pinentry and held by the helper by name, then travels as in 1 to 4;
+   `fido2-assert` reads it on its stdin, because it is run with no terminal
+   (`setsid`) and its passphrase prompt falls back to stdin then.
+
+What this does not change: `bw unlock` itself, on the ordinary path, still
+takes the password through its FIFO, and the session key still reaches every
+`bw` command in its environment ([Limits](#limits)). The hmac-secret is still
+a fixed function of the key and the salt in the envelope summary, so a touch
+given to a request someone else made yields the same secret; which is why the
+panel never asks the key for a touch on its own (below), and why a
+registration that asks for the key's PIN gets a secret a touch alone does not
+([FIDO2 key unlock](../README.md#fido2-key-unlock)).
+
+Falling back, with the vault held in the shell, the panel writes the same
+stdin block itself, and the values are then in the shell as everything else
+is.
+
 ## Typing into pinentry
 
 A string typed into the panel stays in the shell's memory after the field is

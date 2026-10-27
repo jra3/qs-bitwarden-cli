@@ -85,7 +85,7 @@ impl Helper {
     }
 
     fn exec(&mut self, id: u64, script: &str, extra: Value) -> Value {
-        let mut request = json!({ "type": "exec", "v": 1, "id": id, "argv": ["sh", "-c", script] });
+        let mut request = json!({ "type": "exec", "v": 2, "id": id, "argv": ["sh", "-c", script] });
         for (k, v) in extra.as_object().unwrap() {
             request[k] = v.clone();
         }
@@ -94,7 +94,7 @@ impl Helper {
     }
 
     fn query(&mut self, q: u64, mut request: Value) -> Value {
-        request["v"] = json!(1);
+        request["v"] = json!(2);
         request["q"] = json!(q);
         self.send(request);
         self.reply("q", q)
@@ -131,8 +131,8 @@ fn vault_read() -> String {
 #[test]
 fn handshake_and_strictness() {
     let mut helper = Helper::start();
-    helper.send(json!({ "type": "hello", "v": 1 }));
-    assert_eq!(helper.next(), json!({ "type": "ready", "protocol": 1 }));
+    helper.send(json!({ "type": "hello", "v": 2 }));
+    assert_eq!(helper.next(), json!({ "type": "ready", "protocol": 2 }));
     helper.send(json!({ "type": "hello", "v": 9 }));
     assert_eq!(helper.next()["type"], "error");
     writeln!(helper.stdin, "not json").unwrap();
@@ -180,8 +180,8 @@ fn the_session_key_goes_to_runs_and_never_back() {
     );
     assert_eq!(env["out"], "x-gone\n");
 
-    helper.send(json!({ "type": "holdSession", "v": 1, "name": "lock1" }));
-    helper.send(json!({ "type": "forget", "v": 1, "keep": ["lock1"] }));
+    helper.send(json!({ "type": "holdSession", "v": 2, "name": "lock1" }));
+    helper.send(json!({ "type": "forget", "v": 2, "keep": ["lock1"] }));
     let after = helper.exec(5, &check, json!({ "inject": { "BW_SESSION": "session" } }));
     assert_eq!(after["out"], "", "forget drops the key");
     let kept = helper.exec(
@@ -214,7 +214,7 @@ fn a_held_secret_is_injected_by_name() {
         json!({ "inject": { "PW": "secret:master" } }),
     );
     assert_eq!(run["out"], "master pw");
-    helper.send(json!({ "type": "forgetSecret", "v": 1, "name": "master" }));
+    helper.send(json!({ "type": "forgetSecret", "v": 2, "name": "master" }));
     assert_eq!(
         helper.exec(
             3,
@@ -223,6 +223,37 @@ fn a_held_secret_is_injected_by_name() {
         )["out"],
         ""
     );
+}
+
+/// A password, PIN or hmac-secret goes to a run on stdin, as NUL-ended
+/// records, and never into its environment, which every process of the same
+/// user can read. The panel's text follows the block.
+#[test]
+fn secrets_reach_a_run_on_stdin_and_never_its_environment() {
+    let mut helper = Helper::start();
+    helper.exec(1, "printf 'held pw'", json!({ "capture": "secret:master" }));
+    // Read the block as the panel's scripts do, then the rest of stdin.
+    let script = "while IFS= read -r -d '' rec && [ -n \"$rec\" ]; do printf '[%s]' \"$rec\"; done; \
+        printf '|'; cat; printf '|%s' \"${QSBW_SECRET-unset}${QSBW_PIN-unset}\"; env | grep -c QSBW_ | tr -d '\\n' || true";
+    let run = helper.exec(
+        2,
+        script,
+        json!({ "secrets": { "QSBW_SECRET": "typed\npw", "ZZ": "" }, "heldSecrets": { "QSBW_PIN": "secret:master", "NOPE": "secret:gone" },
+                "stdin": "rest" }),
+    );
+    assert_eq!(
+        run["out"],
+        "[QSBW_SECRET=typed\npw][ZZ=][QSBW_PIN=held pw]|rest|unsetunset0"
+    );
+    // Present and empty: only the end record, so a reader never waits.
+    let bare = helper.exec(3, "od -An -c | tr -d ' \n'", json!({ "secrets": {} }));
+    assert_eq!(bare["out"], "\\0");
+    // Absent: stdin is as before (nothing at all).
+    let none = helper.exec(4, "od -An -c | tr -d ' \n'", json!({}));
+    assert_eq!(none["out"], "");
+    // A name that is not a variable is refused before anything runs.
+    let refused = helper.exec(5, "true", json!({ "secrets": { "A=B": "x" } }));
+    assert_eq!(refused["code"], 126);
 }
 
 #[test]
@@ -298,7 +329,7 @@ fn a_pinentry_answer_feeds_the_password_writer_and_bw_login_by_name() {
     assert_eq!(login["code"], 0);
     assert_eq!(login["session"], true);
     assert!(!login["out"].as_str().unwrap().contains("hunter"));
-    helper.send(json!({ "type": "forgetSecret", "v": 1, "name": "login" }));
+    helper.send(json!({ "type": "forgetSecret", "v": 2, "name": "login" }));
     let gone = helper.exec(
         4,
         &write,
@@ -445,10 +476,10 @@ fn one_secret_is_served_or_copied_by_name() {
 fn runs_can_be_killed_and_stdin_is_delivered() {
     let mut helper = Helper::start();
     helper.send(
-        json!({ "type": "exec", "v": 1, "id": 7, "argv": ["sh", "-c", "sleep 30; echo late"] }),
+        json!({ "type": "exec", "v": 2, "id": 7, "argv": ["sh", "-c", "sleep 30; echo late"] }),
     );
     std::thread::sleep(Duration::from_millis(200));
-    helper.send(json!({ "type": "kill", "v": 1, "id": 7 }));
+    helper.send(json!({ "type": "kill", "v": 2, "id": 7 }));
     let killed = helper.reply("id", 7);
     assert_eq!(
         (killed["code"].as_i64(), killed["out"].as_str()),
@@ -458,10 +489,10 @@ fn runs_can_be_killed_and_stdin_is_delivered() {
 
     // A run that ignores SIGTERM is killed after the grace period.
     helper.send(
-        json!({ "type": "exec", "v": 1, "id": 10, "argv": ["sh", "-c", "trap '' TERM; sleep 30"] }),
+        json!({ "type": "exec", "v": 2, "id": 10, "argv": ["sh", "-c", "trap '' TERM; sleep 30"] }),
     );
     std::thread::sleep(Duration::from_millis(200));
-    helper.send(json!({ "type": "kill", "v": 1, "id": 10 }));
+    helper.send(json!({ "type": "kill", "v": 2, "id": 10 }));
     assert_eq!(helper.reply("id", 10)["code"], 137);
 
     let echoed = helper.exec(8, "cat", json!({ "stdin": "payload" }));
@@ -473,13 +504,13 @@ fn runs_can_be_killed_and_stdin_is_delivered() {
 #[test]
 fn a_reused_run_id_is_refused_and_the_first_run_stays_killable() {
     let mut helper = Helper::start();
-    helper.send(json!({ "type": "exec", "v": 1, "id": 21, "argv": ["sh", "-c", "sleep 30"] }));
+    helper.send(json!({ "type": "exec", "v": 2, "id": 21, "argv": ["sh", "-c", "sleep 30"] }));
     std::thread::sleep(Duration::from_millis(200));
     let again = helper.exec(21, "echo second", json!({}));
     assert_eq!(again["code"], 126);
     assert_eq!(again["err"], "run id in use");
     // The first run still has its kill handle and its entry.
-    helper.send(json!({ "type": "kill", "v": 1, "id": 21 }));
+    helper.send(json!({ "type": "kill", "v": 2, "id": 21 }));
     assert_eq!(helper.reply("id", 21)["code"], 143);
 }
 
@@ -491,7 +522,7 @@ fn runs_do_not_outlive_a_crashed_helper() {
         "trap 'echo stopped > {}; exit 0' TERM; while :; do sleep 0.05; done",
         mark.display()
     );
-    helper.send(json!({ "type": "exec", "v": 1, "id": 1, "argv": ["sh", "-c", script] }));
+    helper.send(json!({ "type": "exec", "v": 2, "id": 1, "argv": ["sh", "-c", script] }));
     std::thread::sleep(Duration::from_millis(300));
     // SIGKILL: no cleanup code of the helper's runs.
     helper.child.kill().unwrap();
@@ -547,7 +578,7 @@ fn a_forget_ends_the_copies_still_serving_the_clipboard() {
             "the copy should still be serving before the forget"
         );
 
-        helper.send(json!({ "type": "forget", "v": 1 }));
+        helper.send(json!({ "type": "forget", "v": 2 }));
         let deadline = Instant::now() + Duration::from_secs(5);
         while !dir.join("ended").exists() {
             assert!(

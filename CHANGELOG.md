@@ -71,6 +71,43 @@
   and dropped its status, so a secret service that was not answering read
   as "nothing left"; the entry could come back with the service. The search
   status is kept, and such a clear is reported as unchecked.
+- **The master password, the PIN and the FIDO2 key's secret no longer pass
+  through any process's environment.** The envelope pipelines took them in
+  the shell's environment, which every child (`secret-tool`, `systemd-creds`,
+  `jq`, `head`, `cmp`, `argon2`) inherited and any program running as you
+  could read from `/proc/<pid>/environ` for the length of an unlock; the
+  key's `hmac-secret`, which opens the key's way in again from anywhere, was
+  exported into a nested shell too. They now reach the pipeline on its stdin,
+  as records the vault helper writes, live in unexported shell variables, and
+  reach the unlock tool on a descriptor of its own (`--secrets-fd`); the tool
+  reads only the account from its environment. `bw`'s own check of a typed
+  password reads a pipe as its `--passwordfile` instead of `--passwordenv`,
+  and an older version's PIN blob is decrypted with the PIN on a descriptor.
+  Both helpers' protocols change for this (vault protocol 2, unlock tool
+  command interface v3), so a plugin updated without its helpers reports them as
+  mismatched rather than putting the values back in the environment.
+  See [docs/vault-helper.md](docs/vault-helper.md#where-the-secrets-of-quick-unlock-travel).
+- **The FIDO2 key is asked for a touch only when you press the button.** The
+  locked panel armed the key whenever it opened with a key plugged in, so a
+  touch given to anything else meanwhile (`sudo`, SSH) unlocked the vault,
+  and the secret that touch produced is the same every time. The key now
+  waits for **Unlock with FIDO2 Key**, and the request is dropped when the
+  screen is left.
+- **Registrations that ask for the key's PIN (`+pin`, `+verification`) are
+  supported, and are stronger.** They were refused. The PIN is typed into
+  pinentry under the vault helper, never into the panel, and `fido2-assert`
+  runs with user verification, so the key answers from its verified secret:
+  a touch alone, or a touch given for another prompt, cannot open that way
+  in.
+- **Adding a fingerprint or PIN way in beside a FIDO2 one (or the reverse)
+  warns and asks for a second press**, since the weaker method is then what
+  protects the stored password.
+- **No master-password-only envelope.** A typed unlock stored the password,
+  encrypted, even with every quick-unlock method off, and nothing removed it:
+  an offline guessing target nobody had asked for. It is now written only
+  while a quick-unlock method is turned on (or being turned on), one left
+  with no method is removed at the next start, and `storeMasterPassword:
+  false` in `shell.json` never writes it at all.
 
 ### Changed
 

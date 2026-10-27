@@ -8,9 +8,12 @@ const KEYRING_ACCOUNT = "session"
 const KEYRING_MASTER = "master_password"
 const KEYRING_FIDO = "fido_password"
 
-// `secret-tool store` reads stdin to EOF and Process.write() cannot close
-// stdin, so secrets reach it through this env var, piped in by a shell. Never
-// put a secret in argv: /proc/<pid>/cmdline is world-readable.
+// The names under which the master password and the PIN reach a script.
+// The envelope pipelines take them as records on stdin (see "Secrets on
+// stdin" below), read into plain shell variables; only the session store
+// (keyringStoreScript()) still takes QSBW_SECRET in its environment, piped
+// into `secret-tool store` by a shell since Process.write() cannot close
+// stdin. Never put a secret in argv: /proc/<pid>/cmdline is world-readable.
 const KEYRING_SECRET_ENV = "QSBW_SECRET"
 const KEYRING_PIN = "pin_blob"
 const PIN_ENV = "QSBW_PIN"
@@ -1876,11 +1879,61 @@ function isPinWeak(pin) {
   return pinWeakWarning(pin) !== ""
 }
 
-// Decrypts the legacy PIN blob. Non-zero exit: wrong PIN or no blob.
+// -------------------------------------------------------------------------
+// Secrets on stdin
+// -------------------------------------------------------------------------
+//
+// A script that needs the master password, a PIN or a FIDO2 hmac-secret gets
+// it on stdin, never in its environment: /proc/<pid>/environ is readable by
+// every process running as the same user, for the life of the process and of
+// every child that inherits it (secret-tool, systemd-creds, jq, head, cmp,
+// argon2...). The vault helper (or, falling back, the panel) writes
+// `NAME=value` records ended by NUL, then an empty record; SECRETS_PREAMBLE
+// reads them into plain shell variables -- never exported -- once per
+// process, before anything else runs, and stops at the empty record so the
+// rest of stdin is the script's. A step nested in another script runs as a
+// subshell (nestedScript()), which inherits the variables with no
+// environment at all. The one process that then needs a secret, the unlock
+// tool, gets it on a descriptor of its own: `--secrets-fd 3 3< <(__feed ...)`,
+// a pipe only it and the builtin `printf` behind it ever hold. A value never
+// holds NUL, so `read -d ''` sees it whole, newlines included.
+var SECRET_RECORD_END = "\u0000"
+var SECRETS_PREAMBLE = "if [ -z \"${__secrets_read:-}\" ]; then __secrets_read=1; "
+  + "while IFS= read -r -d '' __rec && [ -n \"$__rec\" ]; do __n=\"${__rec%%=*}\"; "
+  + "case \"$__n\" in ''|[0-9]*|*[!A-Za-z0-9_]*) continue ;; esac; "
+  + "printf -v \"$__n\" '%s' \"${__rec#*=}\"; done; unset __rec __n; fi; "
+  // name value [name value]... -> records for the unlock tool's descriptor.
+  + "__feed() { while [ \"$#\" -ge 2 ]; do printf '%s=%s\\0' \"$1\" \"$2\"; shift 2; done; }; "
+
+function secretsPreamble() { return SECRETS_PREAMBLE }
+
+// The stdin block the panel writes itself when a run falls back to the
+// shell (the helper writes the same from `secrets`/`heldSecrets`).
+function secretBlock(values) {
+  var out = ""
+  for (var name in values) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) continue
+    var value = values[name]
+    out += name + "=" + String(value === undefined || value === null ? "" : value) + SECRET_RECORD_END
+  }
+  return out + SECRET_RECORD_END
+}
+
+// ` --secrets-fd 3 3< <(__feed ...)`: the unlock tool's secrets, from shell
+// expressions. Goes after the tool's other arguments.
+function toolSecrets(pairs) {
+  var feed = ""
+  for (var i = 0; i < pairs.length; i++) feed += " " + pairs[i][0] + " " + pairs[i][1]
+  return " --secrets-fd 3 3< <(__feed" + feed + ")"
+}
+
+// Decrypts the legacy PIN blob, the PIN read from stdin (PIN_ENV record) and
+// handed to openssl on a descriptor. Non-zero exit: wrong PIN or no blob.
 function pinUnlockCommand(slot) {
-  var script = "secret-tool lookup" + keyringAttributes(keyringEntryName(KEYRING_PIN, slot)) + " 2>/dev/null | head -c 8192"
+  var script = SECRETS_PREAMBLE
+    + "secret-tool lookup" + keyringAttributes(keyringEntryName(KEYRING_PIN, slot)) + " 2>/dev/null | head -c 8192"
     + " | openssl enc -d -aes-256-cbc -pbkdf2 -iter " + PIN_ITERATIONS
-    + " -md sha256 -pass env:" + PIN_ENV + " -base64 -A | head -c " + MAX_TOKEN_BYTES
+    + " -md sha256 -pass fd:3 -base64 -A 3< <(printf '%s' \"$" + PIN_ENV + "\") | head -c " + MAX_TOKEN_BYTES
   return ["bash", "-c", cappedScript(script)]
 }
 
@@ -2089,7 +2142,8 @@ function typedSecretEntry(o) {
 
 // purpose: "unlock" (master password), "pin", "reprompt", "login" (the
 // email login's master password), "setupMaster" (the password a quick-unlock
-// setup form confirms) and "newPin" (the PIN that form chooses).
+// setup form confirms), "newPin" (the PIN that form chooses) and "fidoPin"
+// (the FIDO2 key's own PIN, which its registration asks for).
 function pinentryDescription(purpose, email) {
   var who = String(email || "").trim()
   var suffix = who ? " for " + who : ""
@@ -2098,17 +2152,35 @@ function pinentryDescription(purpose, email) {
   if (purpose === "login") return "Log in to Bitwarden" + (who ? " as " + who : "")
   if (purpose === "setupMaster") return "Confirm your Bitwarden master password to add an unlock method" + suffix
   if (purpose === "newPin") return "Choose the PIN that will unlock Bitwarden" + suffix
+  if (purpose === "fidoPin") return "Enter your FIDO2 key's PIN to unlock Bitwarden" + suffix + ", then touch the key"
   return "Unlock Bitwarden" + suffix
 }
 
 function pinentryPrompt(purpose) {
   if (purpose === "pin") return "PIN:"
   if (purpose === "newPin") return "New PIN:"
+  if (purpose === "fidoPin") return "Key PIN:"
   return "Master password:"
 }
 
 // The second field of a new PIN (SETREPEAT).
 function pinentryRepeatPrompt() { return "Repeat PIN:" }
+
+// CTAP's floor for a client PIN. Shorter is asked for again rather than
+// sent, since every refusal spends one of the key's eight tries.
+var FIDO_PIN_MIN_LENGTH = 4
+function fidoPinMinLength() { return FIDO_PIN_MIN_LENGTH }
+
+// Why quick unlock is unavailable with `storeMasterPassword: false`.
+function storeMasterPasswordOffReason() {
+  return "storeMasterPassword is false in shell.json: the master password is never kept in the keyring, "
+    + "so there is nothing for a PIN, fingerprint or key to open."
+}
+
+// An enable form's warning, asking for the second press.
+function downgradeConfirmText(warning) {
+  return "󰀪  " + warning + " Press Enable again to add it anyway."
+}
 
 function keyringClearPinCommand(slot) {
   return keyringClearEntryCommand(keyringEntryName(KEYRING_PIN, slot))
@@ -2130,8 +2202,10 @@ function keyringHasPinCommand(slot) {
 //     -> systemd-creds --user encrypt -> verify -> secret-tool store
 //
 // with `argon2` deriving keys from the password or PIN. QML only ever gets a
-// secret-free summary, or the password on unlock. Secrets travel only in env
-// vars via `printf` (a builtin); salts, parameters and ids may be in argv.
+// secret-free summary, or the password on unlock. Secrets arrive on stdin
+// (SECRETS_PREAMBLE), live in unexported shell variables, and reach argon2
+// and the tool through pipes from `printf` (a builtin); salts, parameters
+// and ids may be in argv. No child's environment ever holds one.
 // Writes commit last: the new envelope is re-opened and checked before
 // `secret-tool store`, so any failure leaves the old one intact.
 var KEYRING_ENVELOPE = "unlock_envelope"
@@ -2141,6 +2215,12 @@ var ENVELOPE_CREDENTIAL_NAME = "qs-bitwarden-unlock"
 var NEW_SECRET_ENV = "QSBW_NEW_SECRET"
 var FIDO_HMAC_ENV = "QSBW_FIDO_HMAC"
 var FIDO_SALT_ENV = "QSBW_FIDO_SALT"
+// The key's own PIN, for a registration made with +pin or +verification.
+var FIDO_PIN_ENV = "QSBW_FIDO_PIN"
+// The tool's record names (unlock-key/src/main.rs).
+var TOOL_PASSWORD = "QSBW_UNLOCK_PASSWORD"
+var TOOL_KEY = "QSBW_UNLOCK_KEY"
+var TOOL_NEW_KEY = "QSBW_UNLOCK_NEW_KEY"
 // Argon2id for new wraps (256 MiB, 4 passes: about 0.46 s per derivation on
 // a 16-thread laptop; see PIN_GUESSES_PER_SECOND for what that means for a
 // PIN). Existing wraps use their recorded parameters; the tool refuses any
@@ -2161,6 +2241,7 @@ var ENVELOPE_EXIT = {
 }
 
 function envelopeNewSecretEnvVar() { return NEW_SECRET_ENV }
+function fidoPinEnvVar() { return FIDO_PIN_ENV }
 function envelopeExitCodes() { return ENVELOPE_EXIT }
 
 var ENVELOPE_BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/
@@ -2168,8 +2249,11 @@ var ENVELOPE_BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/
 // Exits as a usage error, for arguments that should never reach a builder.
 function envelopeRefused() { return ["bash", "-c", "exit 2"] }
 
-// A ["bash", "-c", script] command as a step inside another script.
-function nestedScript(cmd) { return "bash -c " + shellQuote(cmd[2]) }
+// A ["bash", "-c", script] command as a step inside another script: a
+// subshell, so it sees the outer script's variables (the secrets it read
+// from stdin) without an environment, and its `exit` ends only itself. Its
+// own SECRETS_PREAMBLE finds __secrets_read set and reads nothing.
+function nestedScript(cmd) { return "( " + cmd[2] + "\n)" }
 
 function envelopeArgsOk(tool, account) {
   return typeof tool === "string" && tool.charAt(0) === "/"
@@ -2197,7 +2281,7 @@ function envelopeAccountEnv(account) {
 // Functions every envelope script starts with.
 // `slot` picks the account's envelope entry; see keyringEntryName().
 function envelopePrelude(tool, slot) {
-  return "__tool=" + shellQuote(tool) + "; "
+  return SECRETS_PREAMBLE + "__tool=" + shellQuote(tool) + "; "
     + "__name=" + shellQuote(ENVELOPE_CREDENTIAL_NAME) + "; "
     + "__lookup() { secret-tool lookup" + keyringAttributes(keyringEntryName(KEYRING_ENVELOPE, slot))
     + " 2>/dev/null | head -c " + MAX_ENVELOPE_SEALED_BYTES + "; }; "
@@ -2233,9 +2317,9 @@ function envelopePrelude(tool, slot) {
     + ">/dev/null || exit " + ENVELOPE_EXIT.verify + "; }; "
     // ...and yield exactly the password through the way just written. cmp on
     // streams keeps a trailing newline significant; the way's key ($__vk)
-    // goes in the tool's env, never argv.
+    // goes to the tool on its descriptor, never argv or env.
     + "__verify_opens() { cmp -s <(printf '%s' \"$1\") "
-    + "<(__unseal \"$__new\" | QSBW_UNLOCK_KEY=\"$__vk\" \"$__tool\" open \"${@:2}\") "
+    + "<(__unseal \"$__new\" | \"$__tool\" open \"${@:2}\"" + toolSecrets([[TOOL_KEY, "\"$__vk\""]]) + ") "
     + "|| exit " + ENVELOPE_EXIT.verify + "; }; "
     + "__store() { printf '%s' \"$__new\" | secret-tool store --label=" + shellQuote(ENVELOPE_LABEL)
     + keyringAttributes(keyringEntryName(KEYRING_ENVELOPE, slot)) + " || exit " + ENVELOPE_EXIT.store + "; }; "
@@ -2249,6 +2333,12 @@ function envelopeArgon2Args(saltVar) {
 function envelopeNewKey(secretExpr, saltVar) {
   return "__kdf " + secretExpr + " \"$" + saltVar + "\" " + ENVELOPE_ARGON2.t + " "
     + ENVELOPE_ARGON2.m + " " + ENVELOPE_ARGON2.p
+}
+
+// Removes the account's envelope entry: `storeMasterPassword` is off, or no
+// method is on to use it. Nothing else of the account's is touched.
+function unlockEnvelopeClearCommand(slot) {
+  return keyringClearEntryCommand(keyringEntryName(KEYRING_ENVELOPE, slot))
 }
 
 // Secret-free summary: enabled methods, staleness, FIDO2 credentials and
@@ -2271,12 +2361,12 @@ function unlockEnvelopeOpenCommand(tool, account, via) {
   if (via.kind === "master" || via.kind === "pin") {
     var secret = via.kind === "master" ? KEYRING_SECRET_ENV : PIN_ENV
     script += "__k=\"$(__wrap_key '." + via.kind + "' \"$" + secret + "\")\" || exit $?; "
-      + "__unseal \"$__sealed\" | QSBW_UNLOCK_KEY=\"$__k\" " + open + " --via " + via.kind
+      + "__unseal \"$__sealed\" | " + open + " --via " + via.kind + toolSecrets([[TOOL_KEY, "\"$__k\""]])
   } else if (via.kind === "fingerprint") {
     script += "__unseal \"$__sealed\" | " + open + " --via fingerprint"
   } else if (via.kind === "fido" && ENVELOPE_BASE64_RE.test(String(via.cred || ""))) {
-    script += "__unseal \"$__sealed\" | QSBW_UNLOCK_KEY=\"$" + FIDO_HMAC_ENV + "\" " + open
-      + " --via fido --cred " + shellQuote(via.cred)
+    script += "__unseal \"$__sealed\" | " + open + " --via fido --cred " + shellQuote(via.cred)
+      + toolSecrets([[TOOL_KEY, "\"$" + FIDO_HMAC_ENV + "\""]])
   } else {
     return envelopeRefused()
   }
@@ -2292,9 +2382,9 @@ function unlockEnvelopeCreateCommand(tool, account) {
     + "__s=\"$(__salt)\"; "
     + "__k=\"$(" + envelopeNewKey("\"$" + KEYRING_SECRET_ENV + "\"", "__s") + ")\" || exit "
     + ENVELOPE_EXIT.kdf + "; "
-    + "__new=\"$(QSBW_UNLOCK_PASSWORD=\"$" + KEYRING_SECRET_ENV + "\" QSBW_UNLOCK_NEW_KEY=\"$__k\" "
-    + "\"$__tool\" create" + envelopeArgon2Args("__s") + " | __seal)\" "
-    + "|| exit $?; "
+    + "__new=\"$(\"$__tool\" create" + envelopeArgon2Args("__s")
+    + toolSecrets([[TOOL_PASSWORD, "\"$" + KEYRING_SECRET_ENV + "\""], [TOOL_NEW_KEY, "\"$__k\""]])
+    + " | __seal)\" || exit $?; "
     + "__verify_account \"$" + ENVELOPE_ACCOUNT_ID_ENV + "\" \"$" + ENVELOPE_SERVER_ENV + "\"; "
     + "__vk=\"$__k\"; __verify_opens \"$" + KEYRING_SECRET_ENV + "\""
     + " --via master; "
@@ -2324,12 +2414,12 @@ function unlockEnvelopeUpdateCommand(tool, account, op) {
   if (op.kind === "add-pin") {
     pre = masterKey + "__s=\"$(__salt)\"; "
       + "__pk=\"$(" + envelopeNewKey("\"$" + PIN_ENV + "\"", "__s") + ")\" || exit " + ENVELOPE_EXIT.kdf + "; "
-    transform = "QSBW_UNLOCK_KEY=\"$__mk\" QSBW_UNLOCK_NEW_KEY=\"$__pk\" \"$__tool\" add"
-      + " --auth master --method pin" + envelopeArgon2Args("__s")
+    transform = "\"$__tool\" add --auth master --method pin" + envelopeArgon2Args("__s")
+      + toolSecrets([[TOOL_KEY, "\"$__mk\""], [TOOL_NEW_KEY, "\"$__pk\""]])
     verifyOpen = "__vk=\"$__pk\"; __verify_opens \"$" + KEYRING_SECRET_ENV + "\" --via pin; "
   } else if (op.kind === "add-fingerprint") {
     pre = masterKey
-    transform = "QSBW_UNLOCK_KEY=\"$__mk\" \"$__tool\" add --auth master --method fingerprint"
+    transform = "\"$__tool\" add --auth master --method fingerprint" + toolSecrets([[TOOL_KEY, "\"$__mk\""]])
     verifyOpen = "__vk=''; __verify_opens \"$" + KEYRING_SECRET_ENV + "\" --via fingerprint; "
   } else if (op.kind === "add-fido") {
     // `saltFromEnv`: a fresh salt drawn earlier in the same pipeline.
@@ -2338,9 +2428,10 @@ function unlockEnvelopeUpdateCommand(tool, account, op) {
         || (!op.saltFromEnv && !ENVELOPE_BASE64_RE.test(String(op.salt || "")))
         || !op.rp || /[\x00-\x1f\x7f]/.test(String(op.rp))) return envelopeRefused()
     pre = masterKey
-    transform = "QSBW_UNLOCK_KEY=\"$__mk\" QSBW_UNLOCK_NEW_KEY=\"$" + FIDO_HMAC_ENV + "\" \"$__tool\" add"
+    transform = "\"$__tool\" add"
       + " --auth master --method fido --cred " + shellQuote(op.cred) + " --rp " + shellQuote(op.rp)
       + " --fido-salt " + saltArg
+      + toolSecrets([[TOOL_KEY, "\"$__mk\""], [TOOL_NEW_KEY, "\"$" + FIDO_HMAC_ENV + "\""]])
     verifyOpen = "__vk=\"$" + FIDO_HMAC_ENV + "\"; __verify_opens \"$" + KEYRING_SECRET_ENV + "\""
       + " --via fido --cred " + shellQuote(op.cred) + "; "
   } else if (op.kind === "remove") {
@@ -2355,22 +2446,23 @@ function unlockEnvelopeUpdateCommand(tool, account, op) {
     transform = "\"$__tool\" mark-stale"
   } else if (op.kind === "rotate" && op.auth) {
     var auth = op.auth
-    var authArgs = ""
+    var authKey = null
     if (auth.kind === "master" || auth.kind === "pin") {
       var authSecret = auth.kind === "master" ? KEYRING_SECRET_ENV : PIN_ENV
       pre = "__ak=\"$(__wrap_key '." + auth.kind + "' \"$" + authSecret + "\")\" || exit $?; "
-      authArgs = "QSBW_UNLOCK_KEY=\"$__ak\" "
+      authKey = [TOOL_KEY, "\"$__ak\""]
     } else if (auth.kind === "fido" && ENVELOPE_BASE64_RE.test(String(auth.cred || ""))) {
-      authArgs = "QSBW_UNLOCK_KEY=\"$" + FIDO_HMAC_ENV + "\" "
+      authKey = [TOOL_KEY, "\"$" + FIDO_HMAC_ENV + "\""]
     } else if (auth.kind !== "fingerprint") {
       return envelopeRefused()
     }
     pre += "__s=\"$(__salt)\"; "
       + "__nk=\"$(" + envelopeNewKey("\"$" + NEW_SECRET_ENV + "\"", "__s") + ")\" || exit " + ENVELOPE_EXIT.kdf + "; "
-    transform = authArgs + "QSBW_UNLOCK_PASSWORD=\"$" + NEW_SECRET_ENV + "\" QSBW_UNLOCK_NEW_KEY=\"$__nk\" "
-      + "\"$__tool\" rotate --auth " + auth.kind
+    var rotateSecrets = [[TOOL_PASSWORD, "\"$" + NEW_SECRET_ENV + "\""], [TOOL_NEW_KEY, "\"$__nk\""]]
+    if (authKey) rotateSecrets.unshift(authKey)
+    transform = "\"$__tool\" rotate --auth " + auth.kind
       + (auth.kind === "fido" ? " --auth-cred " + shellQuote(auth.cred) : "")
-      + envelopeArgon2Args("__s")
+      + envelopeArgon2Args("__s") + toolSecrets(rotateSecrets)
     verifyOpen = "__vk=\"$__nk\"; __verify_opens \"$" + NEW_SECRET_ENV + "\" --via master; "
   } else {
     return envelopeRefused()
@@ -2528,7 +2620,7 @@ function quickUnlockPurgeCommand(tool, slots, method) {
 function unlockEnvelopeCheckCommand(tool, account) {
   var open = unlockEnvelopeOpenCommand(tool, account, { kind: "master" })
   if (open[2] === envelopeRefused()[2]) return envelopeRefused()
-  return ["bash", "-c", nestedScript(open) + " >/dev/null"]
+  return ["bash", "-c", SECRETS_PREAMBLE + nestedScript(open) + " >/dev/null"]
 }
 
 // Quick unlock also needs `argon2` (ships with bitwarden-cli) and a working
@@ -2557,9 +2649,13 @@ function parseQuickUnlockPrereqs(raw) {
 
 // Verifies a typed master password with `bw` when there is no envelope to
 // check it against. `bw unlock` mints a new session key, which the caller
-// adopts.
+// adopts. The password comes in on stdin (KEYRING_SECRET_ENV record) and
+// reaches bw as a file that is a pipe, as the unlock's FIFO does, so it is
+// in no process's environment -- not even bw's, which --passwordenv would
+// need.
 function bwVerifyPasswordCommand() {
-  var script = "bw unlock --passwordenv " + KEYRING_SECRET_ENV + " --raw 2>/dev/null | head -c " + MAX_TOKEN_BYTES
+  var script = SECRETS_PREAMBLE
+    + "bw unlock --passwordfile <(printf '%s' \"$" + KEYRING_SECRET_ENV + "\") --raw 2>/dev/null | head -c " + MAX_TOKEN_BYTES
   return ["bash", "-c", cappedScript(script, MAX_STDERR_BYTES)]
 }
 
@@ -2576,11 +2672,11 @@ function legacyMigrationExitCodes() { return LEGACY_MIGRATION_EXIT }
 // (`passwordFromKeyring`) or is already in KEYRING_SECRET_ENV.
 function legacyMigrationCommand(tool, account, legacyAccount, addOp, passwordFromKeyring) {
   if (!envelopeArgsOk(tool, account)) return envelopeRefused()
-  var script = ""
+  var script = SECRETS_PREAMBLE
   if (passwordFromKeyring) {
     script += "__pw=\"$(" + keyringReadScript(keyringEntryName(legacyAccount, account.slot)) + ")\"; "
       + "[ -n \"$__pw\" ] || exit " + LEGACY_MIGRATION_EXIT.none + "; "
-      + "export " + KEYRING_SECRET_ENV + "=\"$__pw\"; unset __pw; "
+      + KEYRING_SECRET_ENV + "=\"$__pw\"; unset __pw; "
   } else {
     script += "[ -n \"${" + KEYRING_SECRET_ENV + ":-}\" ] || exit " + LEGACY_MIGRATION_EXIT.none + "; "
   }
@@ -2619,9 +2715,22 @@ function legacyPinMigrationCommand(tool, account) {
 // hmac-secret, which is the key to the envelope's FIDO wrap; the key requires
 // a touch for it. The random client data hash is discarded: only the
 // hmac-secret is used.
+//
+// A registration made with +pin or +verification asks the key's own PIN as
+// well (`target.needsPin`): fido2-assert runs with `-t pin=true`, which is
+// user verification, and the key then answers from its CredRandomWithUV, a
+// secret a touch alone never yields (CTAP 2.1 hmac-secret). So the wrap is
+// as strong as the registration, and a key that was only touched -- for a
+// sudo prompt, say, or by an attacker's own assertion -- cannot open it. The
+// PIN is typed into pinentry under the vault helper and arrives as the
+// FIDO_PIN_ENV record on stdin; fido2-assert reads it there because it has
+// no terminal (`setsid`): its readpassphrase() falls back to stdin when
+// /dev/tty cannot be opened. The assertion parameters, which are not secret,
+// then go in through `-i` so stdin carries the PIN alone.
 var FIDO_EXIT = {
-  assert: 31,     // fido2-assert failed: no touch in time, a refusal, or a busy key
+  assert: 31,     // fido2-assert failed: no touch in time, a refusal, a wrong PIN, or a busy key
   noSecret: 32,   // it answered, but without an hmac-secret
+  noPin: 33,      // the registration asks for the key's PIN and none arrived
   legacyUsed: 40  // unlocked with the old plaintext entry; migration did not finish
 }
 
@@ -2633,36 +2742,47 @@ function fidoTargetOk(target) {
     && typeof target.rp === "string" && /^pam:\/\/[A-Za-z0-9.-]+$/.test(target.rp)
 }
 
-// One touch; the hmac-secret for `saltExpr` is exported in FIDO_HMAC_ENV,
-// never as an argument.
+// One touch (and the key's PIN when the registration asks for it); the
+// hmac-secret for `saltExpr` lands in the FIDO_HMAC_ENV shell variable,
+// never exported, never an argument.
 function fidoAssertScript(target, saltExpr) {
+  var params = "printf '%s\\n%s\\n%s\\n%s\\n' \"$__cdh\" " + shellQuote(target.rp) + " "
+    + shellQuote(target.cred) + " " + saltExpr
+  var assert
+  if (target.needsPin) {
+    assert = "[ -n \"${" + FIDO_PIN_ENV + ":-}\" ] || exit " + FIDO_EXIT.noPin + "; "
+      + "__out=\"$(printf '%s\\n' \"$" + FIDO_PIN_ENV + "\" | setsid -w timeout 45 fido2-assert -G -h -t pin=true "
+      + "-i <(" + params + ") " + shellQuote(target.device) + " 2>/dev/null)\""
+  } else {
+    assert = "__out=\"$(" + params + " | timeout 45 fido2-assert -G -h " + shellQuote(target.device) + " 2>/dev/null)\""
+  }
   return "__cdh=\"$(head -c 32 /dev/urandom | base64 -w0)\"; "
-    + "__out=\"$(printf '%s\\n%s\\n%s\\n%s\\n' \"$__cdh\" " + shellQuote(target.rp) + " "
-    + shellQuote(target.cred) + " " + saltExpr + " | timeout 45 fido2-assert -G -h "
-    + shellQuote(target.device) + " 2>/dev/null)\" || exit " + FIDO_EXIT.assert + "; "
+    + assert + " || exit " + FIDO_EXIT.assert + "; "
     + "__hmac=\"$(printf '%s\\n' \"$__out\" | sed -n 5p)\"; unset __out; "
     + "[ -n \"$__hmac\" ] || exit " + FIDO_EXIT.noSecret + "; "
-    + "export " + FIDO_HMAC_ENV + "=\"$__hmac\"; unset __hmac; "
+    + FIDO_HMAC_ENV + "=\"$__hmac\"; unset __hmac; "
 }
 
 function fidoNewSaltScript() {
-  return "export " + FIDO_SALT_ENV + "=\"$(head -c 32 /dev/urandom | base64 -w0)\"; "
+  return FIDO_SALT_ENV + "=\"$(head -c 32 /dev/urandom | base64 -w0)\"; "
 }
 
-// Unlock through an existing FIDO wrap, using its salt.
+// Unlock through an existing FIDO wrap, using its salt. With
+// `target.needsPin`, the key's PIN is the FIDO_PIN_ENV record on stdin.
 function fidoUnlockCommand(tool, account, target) {
   if (!envelopeArgsOk(tool, account) || !fidoTargetOk(target)
       || !ENVELOPE_BASE64_RE.test(String(target.salt || ""))) return envelopeRefused()
-  var script = fidoAssertScript(target, shellQuote(target.salt))
+  var script = SECRETS_PREAMBLE + fidoAssertScript(target, shellQuote(target.salt))
     + nestedScript(unlockEnvelopeOpenCommand(tool, account, { kind: "fido", cred: target.cred }))
   return ["bash", "-c", cappedScript(script, MAX_STDERR_BYTES)]
 }
 
-// Adds a FIDO wrap: the typed master password authorizes, one touch gives the
-// hmac-secret for a fresh salt. Exit 10: no envelope yet.
+// Adds a FIDO wrap: the typed master password authorizes, one touch (and the
+// key's PIN, as for unlocking) gives the hmac-secret for a fresh salt. Exit
+// 10: no envelope yet.
 function fidoEnrollCommand(tool, account, target) {
   if (!envelopeArgsOk(tool, account) || !fidoTargetOk(target)) return envelopeRefused()
-  var script = fidoNewSaltScript() + fidoAssertScript(target, "\"$" + FIDO_SALT_ENV + "\"")
+  var script = SECRETS_PREAMBLE + fidoNewSaltScript() + fidoAssertScript(target, "\"$" + FIDO_SALT_ENV + "\"")
     + nestedScript(unlockEnvelopeUpdateCommand(tool, account,
       { kind: "add-fido", cred: target.cred, rp: target.rp, saltFromEnv: true }))
   return ["bash", "-c", cappedScript(script, MAX_STDERR_BYTES)]
@@ -2675,10 +2795,11 @@ function fidoLegacyUnlockCommand(tool, account, target) {
   if (!envelopeArgsOk(tool, account) || !fidoTargetOk(target)) return envelopeRefused()
   var migrate = legacyMigrationCommand(tool, account, KEYRING_FIDO,
     { kind: "add-fido", cred: target.cred, rp: target.rp, saltFromEnv: true }, false)
-  var script = "__pw=\"$(" + keyringReadScript(keyringEntryName(KEYRING_FIDO, account.slot)) + ")\"; "
+  var script = SECRETS_PREAMBLE
+    + "__pw=\"$(" + keyringReadScript(keyringEntryName(KEYRING_FIDO, account.slot)) + ")\"; "
     + "[ -n \"$__pw\" ] || exit " + LEGACY_MIGRATION_EXIT.none + "; "
     + fidoNewSaltScript() + fidoAssertScript(target, "\"$" + FIDO_SALT_ENV + "\"")
-    + "export " + KEYRING_SECRET_ENV + "=\"$__pw\"; "
+    + KEYRING_SECRET_ENV + "=\"$__pw\"; "
     + "if " + nestedScript(migrate) + " >/dev/null; then "
     + nestedScript(unlockEnvelopeOpenCommand(tool, account, { kind: "fido", cred: target.cred }))
     + " && exit 0; fi; "
@@ -5697,9 +5818,10 @@ function helperReady(inspection) {
 // helper. If it fails, only quick unlock is disabled.
 var UNLOCK_KEY_ENVELOPE_VERSION = 1
 // The command-line contract the builders above speak. v2 reads the account from
-// QSBW_ACCOUNT_ID and QSBW_SERVER instead of --account-id and --server, so a
-// v1 binary (which would refuse the missing flags) is turned away up front.
-var UNLOCK_KEY_CLI_VERSION = 2
+// QSBW_ACCOUNT_ID and QSBW_SERVER instead of --account-id and --server; v3
+// takes secrets on `--secrets-fd`, never from the environment. An older
+// binary (which would read neither) is turned away up front.
+var UNLOCK_KEY_CLI_VERSION = 3
 var UNLOCK_KEY_BUNDLED_RELATIVE = "bin/x86_64-linux/qs-bitwarden-unlock-key"
 var UNLOCK_KEY_DEVELOPMENT_RELATIVE = "unlock-key/target/debug/qs-bitwarden-unlock-key"
 
@@ -5735,7 +5857,9 @@ function parseUnlockKeyInspection(raw) {
 // Shipped and inspected like the other helpers. If it is missing or fails,
 // the panel works as before (the session and secrets in the shell) and says
 // crash protection is off.
-var VAULT_HELPER_PROTOCOL = 1
+// 2: `secrets`/`heldSecrets` on exec, written to the run's stdin
+// (secretBlock()) instead of its environment.
+var VAULT_HELPER_PROTOCOL = 2
 // What `session` holds while the helper has the key: the helper prints this
 // in the key's place, shaped like a key so the panel's parsing is unchanged.
 var VAULT_HELD_SESSION = "HELD-BY-QS-BITWARDEN-VAULT-HELPER-SESSION"
@@ -5801,9 +5925,18 @@ function vaultHelperLine(type, fields) {
 }
 
 // A run's request: `env` values are strings, or null to unset; `inject`
-// names a held value per variable ("session" or "secret:<name>").
-function vaultExecLine(id, argv, env, inject, capture, stdin) {
+// names a held value per variable ("session" or "secret:<name>"). `secrets`
+// (values) and `heldSecrets` (names, as `inject`) go to the run's stdin
+// instead, ahead of `stdin`; `secrets` is sent whenever given, even empty,
+// so the script's reader never waits (SECRETS_PREAMBLE).
+function vaultExecLine(id, argv, env, inject, capture, stdin, secrets, heldSecrets) {
   var fields = { id: id, argv: argv, env: vaultEnv(env || {}), inject: inject || {}, capture: capture || "plain" }
+  if (secrets !== undefined && secrets !== null) {
+    var values = {}
+    for (var k in secrets) values[k] = String(secrets[k] === undefined || secrets[k] === null ? "" : secrets[k])
+    fields.secrets = values
+  }
+  if (heldSecrets && Object.keys(heldSecrets).length > 0) fields.heldSecrets = heldSecrets
   if (stdin !== undefined && stdin !== null && stdin !== "") fields.stdin = String(stdin)
   return vaultHelperLine("exec", fields)
 }

@@ -4,6 +4,35 @@
 
 ### Security
 
+- **Locking ends the copies still on the clipboard.** The vault helper hands
+  a copied password to `wl-copy` with a timed clear, but a copy that had
+  started just before a lock kept serving the password until its own timer
+  ran out, past the lock-time clear. The helper now keeps a list of the
+  copies it has serving and ends them when the panel locks, logs out or
+  switches accounts. The timed clear is still the copy's own, so it survives
+  a shell or helper crash as before.
+- **A shipped helper is not run without its checksum line.** With
+  `bin/SHA256SUMS` missing the check reported the helper usable with its
+  checksum "unchecked" and ran it; it now refuses it as an incomplete
+  install. The `target/debug` fallback is no longer automatic: a source
+  checkout sets `allowDevelopmentHelpers` to `true` in `shell.json` to use
+  its own builds.
+- **Lock on screen lock sees a `hyprlock` started by hand.** The poll asked
+  only the shell's lock plugin; it now also reads the compositor's session
+  lock through `omarchy-hyprland-session-locked`, and either locks the
+  vault. A reading the compositor cannot give locks nothing but keeps SSH
+  prompts off the screen.
+- **The terminal login hands its session key over a pipe, not a file.** The
+  key used to sit in a file under `$XDG_RUNTIME_DIR` until the panel read it
+  or ten minutes passed; it now waits in the terminal shell's memory and
+  crosses a named pipe the panel opens once, and nothing lands on the
+  filesystem.
+- **The keyring repair's backups expire.** `scripts/repair-keyring.sh` kept
+  the whole keyring file it rewrote, every application's secrets included,
+  with no end. Its backups are now mode `600`, removed after 30 days by the
+  start-up check, and removed at once by **Remove Plugin Data**; the
+  uninstall page says how by hand.
+
 - **A remembered session no longer falls back to the on-disk keyring.** With
   `rememberSession` on, the session key was written to libsecret's
   memory-only `session` collection, and when that store failed (a secret

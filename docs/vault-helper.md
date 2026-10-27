@@ -32,8 +32,15 @@ dump taken after you revealed something can still contain it.
 
 A password or other secret you copy goes from the helper straight to
 `wl-copy` (with the same timed clear and "sensitive" marking); it never passes
-through the shell. TOTP codes are computed in the helper, and only the code
-reaches the shell, not the key. Search runs in the helper too, so it still
+through the shell. The helper keeps a list of the copies it has serving, and
+a lock, logout or account switch ends them along with everything else it
+holds, so a copy that started just before the lock does not stay on the
+clipboard until its own timer runs out. The timer itself is the copy's
+(`timeout` around `wl-copy`), so a copy still clears on schedule if the
+helper or the shell dies first. Values the shell copies itself (TOTP codes,
+usernames, generated passwords, Send links) are not on that list; the lock
+clears them only if they are still the current selection. TOTP codes are
+computed in the helper, and only the code reaches the shell, not the key. Search runs in the helper too, so it still
 finds text in notes the shell does not have, and it stays fast on a large
 vault. Notes of an item that asks for the master password are not searched.
 
@@ -42,12 +49,12 @@ revealed, copied or edited, and its TOTP code is fetched only when you reveal
 or copy it.
 
 Locking, logging out and switching accounts tell the helper to forget
-everything. A lock that is still running `bw lock` keeps its own copy of the
-key until it finishes. A shell unload while unlocked starts a detached
-`bw lock` through the helper before it stops, unless the session is
-remembered and its keyring copy was checked to be in the memory-only
-collection; suspend, shutdown and reboot lock through the normal path under
-a logind delay inhibitor.
+everything, copies on the clipboard included. A lock that is still running
+`bw lock` keeps its own copy of the key until it finishes. A shell unload
+while unlocked starts a detached `bw lock` through the helper before it
+stops, unless the session is remembered and its keyring copy was checked to
+be in the memory-only collection; suspend, shutdown and reboot lock through
+the normal path under a logind delay inhibitor.
 
 ## How the shell talks to it
 
@@ -196,8 +203,12 @@ other way, such as `gcr-prompter` for `pinentry-gnome3`
 
 It is checked like the other helpers: present, executable, the right
 architecture, the checksum in `bin/SHA256SUMS`, its own self-test, and the
-protocol version. A locally built one (`vault/target/debug/`) is used if the
-shipped one is absent or unusable.
+protocol version. Without `bin/SHA256SUMS`, or without its line in it, the
+shipped binary is not run at all; the check reports an incomplete install. A
+locally built one (`vault/target/debug/`) is tried after the shipped one
+only when `allowDevelopmentHelpers` is `true` in `shell.json`; a plugin
+install never falls back to one on its own, since it has no recorded digest
+and no provenance.
 
 If none can be used when the shell starts, the vault stays locked: commands
 wait, and a banner says why and offers to check again, which runs the whole

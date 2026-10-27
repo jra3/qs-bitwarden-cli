@@ -940,7 +940,7 @@ Item {
 
   function inspectSshAgentHelper() {
     if (sshAgentHelperProc.running) return
-    sshAgentHelperProc.command = Model.sshAgentHelperInspectCommand(root.sshAgentPluginDir)
+    sshAgentHelperProc.command = Model.sshAgentHelperInspectCommand(root.sshAgentPluginDir, root.allowDevelopmentHelpers)
     sshAgentHelperProc.running = true
   }
 
@@ -956,7 +956,7 @@ Item {
 
   function inspectUnlockKey() {
     if (unlockKeyProc.running || sshAgentPluginDir === "") return
-    unlockKeyProc.command = Model.unlockKeyInspectCommand(root.sshAgentPluginDir)
+    unlockKeyProc.command = Model.unlockKeyInspectCommand(root.sshAgentPluginDir, root.allowDevelopmentHelpers)
     unlockKeyProc.running = true
   }
 
@@ -1004,6 +1004,10 @@ Item {
   property var vaultLocalSecrets: ({})
   // Only in shell.json, never in the settings screen, and only `true` counts.
   readonly property bool allowVaultWithoutHelper: setting("allowVaultWithoutHelper", false) === true
+  // Likewise: lets a source checkout run its own `target/debug` helpers when
+  // the shipped ones are absent or fail their check. Off, a helper without a
+  // matching SHA256SUMS line is never run (Model.helperInspectCommand()).
+  readonly property bool allowDevelopmentHelpers: setting("allowDevelopmentHelpers", false) === true
 
   function inspectVaultHelper() {
     if (vaultHelperInspectProc.running) return
@@ -1013,7 +1017,7 @@ Item {
       useVaultFallback("the plugin's directory is not known, so the vault helper cannot be found.")
       return
     }
-    vaultHelperInspectProc.command = Model.vaultHelperInspectCommand(root.sshAgentPluginDir)
+    vaultHelperInspectProc.command = Model.vaultHelperInspectCommand(root.sshAgentPluginDir, root.allowDevelopmentHelpers)
     vaultHelperInspectProc.running = true
   }
 
@@ -8378,11 +8382,14 @@ Item {
   property bool screenIsLocked: false
   property double screenLockCheckedAt: 0
 
+  // An undetermined reading counts as locked for the agent (no prompt over
+  // a screen that may be locked), but locks nothing.
   function onScreenLockState(raw) {
-    root.screenIsLocked = Model.screenIsLocked(raw)
+    var locked = Model.screenIsLocked(raw)
+    root.screenIsLocked = locked || Model.screenLockUndetermined(raw)
     root.screenLockCheckedAt = Date.now()
     if (!lockOnScreenLock || status !== "unlocked") return
-    if (root.screenIsLocked) lockVault()
+    if (locked) lockVault()
   }
 
   function onSleepSignal(line) {

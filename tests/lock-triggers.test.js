@@ -4,10 +4,12 @@
 //
 //   node tests/lock-triggers.test.js
 
-const { createSuite, loadModule, read } = require("./harness")
+const { createSuite, loadModule, read, readPluginSource, functionBody } = require("./harness")
 const fs = require("fs")
 const path = require("path")
-const { execFileSync } = require("child_process")
+const os = require("os")
+const { execFileSync, spawn } = require("child_process")
+const panelSrc = readPluginSource("Service.qml")
 
 const Model = loadModule()
 
@@ -44,6 +46,60 @@ check("screen lock state is asked of the shell's own lock plugin",
 
 check("screen lock state bounds what it will read back",
   /head -c \d+/.test(lockCmd.join(" ")), lockCmd.join(" "))
+
+// A `hyprlock` run by hand never goes through the lock plugin; the compositor
+// still knows, and Omarchy's detector reads it off hyprctl.
+check("and of the compositor, through Omarchy's session-lock detector",
+  lockCmd.join(" ").includes("omarchy-hyprland-session-locked"), lockCmd.join(" "))
+
+for (const [raw, want] of [["undetermined", true], ["true", false], ["false", false], ["", false]]) {
+  check(`screenLockUndetermined(${JSON.stringify(raw)}) is ${want}`,
+    Model.screenLockUndetermined(raw) === want, String(Model.screenLockUndetermined(raw)))
+}
+
+// The probe, run with both sources stubbed: the plugin's answer and the
+// detector's exit status, in every combination that matters.
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "qsbw-screenlock-"))
+  try {
+    const probe = (plugin, detector) => {
+      fs.writeFileSync(path.join(dir, "omarchy-shell"), plugin === null
+        ? "#!/bin/sh\necho 'Target not found.' >&2; exit 1\n"
+        : `#!/bin/sh\nprintf '%s\\n' ${JSON.stringify(plugin)}\n`, { mode: 0o755 })
+      // A missing detector is a 127 from the shell, which the real one may
+      // shadow on this machine's PATH, so it is stubbed as that.
+      if (detector === null) fs.writeFileSync(path.join(dir, "omarchy-hyprland-session-locked"), "#!/bin/sh\nexit 127\n", { mode: 0o755 })
+      else fs.writeFileSync(path.join(dir, "omarchy-hyprland-session-locked"), `#!/bin/sh\nexit ${detector}\n`, { mode: 0o755 })
+      return execFileSync(lockCmd[0], lockCmd.slice(1),
+        { encoding: "utf8", env: { PATH: `${dir}:/usr/bin:/bin` } }).trim()
+    }
+    for (const [plugin, detector, want, why] of [
+      ["true", 1, "true", "the lock plugin's lock counts even if the compositor disagrees"],
+      ["false", 0, "true", "a compositor lock the plugin did not start still counts"],
+      ["false", 1, "false", "neither locked is unlocked"],
+      [null, 1, "false", "no lock plugin is not a lock"],
+      [null, null, "false", "no plugin and no detector is not a lock"],
+      ["false", 2, "undetermined", "a compositor that cannot be asked is reported as such"],
+      ["true", null, "true", "the plugin's lock needs no detector"],
+    ]) {
+      const got = probe(plugin, detector)
+      check(why, got === want, `plugin=${plugin} detector=${detector}: got ${JSON.stringify(got)}`)
+      check(`and the vault locks only on true (${why})`,
+        Model.screenIsLocked(got) === (want === "true"), got)
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+// The vault locks on a lock; the agent also refuses prompts on an
+// undetermined reading.
+{
+  const onState = functionBody(panelSrc, "onScreenLockState")
+  check("an undetermined screen counts as locked for prompts but does not lock the vault",
+    /screenIsLocked = locked \|\| Model\.screenLockUndetermined\(raw\)/.test(onState)
+      && /if \(locked\) lockVault\(\)/.test(onState), onState)
+}
 
 check("screen lock poll is a sane interval",
   Model.screenLockPollMs() >= 1000 && Model.screenLockPollMs() <= 15000,
@@ -94,8 +150,6 @@ check("sed is unbuffered, so the token is not held back past the suspend",
 // inhibitor is held until that ack, or the cap if none comes, and the loop is
 // ready for the next suspend either way. The monitor runs as it does in the
 // shell: its own process group, stdin a pipe the owner holds.
-const os = require("os")
-const { spawn } = require("child_process")
 const work = fs.mkdtempSync(path.join(os.tmpdir(), "qsbw-lock-"))
 const log = path.join(work, "inhibit.log")
 // Real gdbus is a single process, so the stub execs its wait rather than
@@ -282,7 +336,8 @@ check("an unexpected handoff is still removed",
 check("an expected handoff is removed once consumed",
   expecting.includes("rm -f"), expecting)
 
-// Both forms, run for real against a planted file.
+// Both forms, run for real against a pipe with a writer waiting on it, as the
+// terminal leaves one.
 {
   const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "qsbw-handoff-"))
   try {
@@ -295,18 +350,43 @@ check("an expected handoff is removed once consumed",
       ["expected", expecting, KEY],
       ["unexpected", discarding, ""],
     ]) {
-      fs.writeFileSync(file, KEY)
+      execFileSync("mkfifo", ["-m", "600", file])
+      const writer = spawn("bash", ["-c", 'printf "%s" "$KEY" > "$1"', "_", file],
+        { env: { PATH: process.env.PATH, KEY }, stdio: "ignore" })
       const out = execFileSync("bash", ["-c", script],
         { encoding: "utf8", env: { ...process.env, XDG_RUNTIME_DIR: runtime } })
       check(`an ${label} handoff returns ${wantOut ? "the key" : "nothing"}`,
         out.trim() === wantOut, JSON.stringify(out))
-      check(`an ${label} handoff leaves no file behind`,
-        !fs.existsSync(file), "file still present")
+      check(`an ${label} handoff leaves no pipe behind`,
+        !fs.existsSync(file), "pipe still present")
+      // An unexpected handoff's writer is left waiting on a pipe that is gone.
+      writer.kill()
     }
+
   } finally {
     fs.rmSync(runtime, { recursive: true, force: true })
   }
 }
+
+// A pipe nobody is writing: the read is bounded, and the pipe goes. Run
+// without blocking, so the suspend checks' timing above is not disturbed.
+const noWriterCheck = new Promise(resolve => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "qsbw-handoff-"))
+  const file = path.join(runtime, "qs-bitwarden-cli", "session-handoff")
+  fs.mkdirSync(path.dirname(file))
+  execFileSync("mkfifo", ["-m", "600", file])
+  const started = Date.now()
+  let out = ""
+  const child = spawn("bash", ["-c", expecting], { env: { ...process.env, XDG_RUNTIME_DIR: runtime } })
+  child.stdout.on("data", chunk => { out += chunk })
+  child.on("close", () => {
+    check("a pipe with no writer yields nothing within its timeout",
+      out === "" && Date.now() - started < 9000 && !fs.existsSync(file),
+      `${JSON.stringify(out)} after ${Date.now() - started}ms`)
+    fs.rmSync(runtime, { recursive: true, force: true })
+    resolve()
+  })
+})
 
 // -------------------------------------------------------------------------
 // Both settings reach the settings screen
@@ -331,4 +411,4 @@ for (const k of ["lockOnScreenLock", "lockOnSuspend"]) {
 
 // -------------------------------------------------------------------------
 
-suspendChecks.then(done, error => { console.error(error); process.exit(1) })
+Promise.all([suspendChecks, noWriterCheck]).then(done, error => { console.error(error); process.exit(1) })

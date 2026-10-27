@@ -6,7 +6,7 @@ use qs_bitwarden_vault::control::{self, Capture, Request, Source};
 use qs_bitwarden_vault::store::{self, Store};
 use qs_bitwarden_vault::{harden_process, self_test, totp};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, Stdio};
@@ -43,6 +43,11 @@ struct Helper {
     runs: Shared<HashMap<u64, u32>>,
     /// Detached commands still running.
     detached: Arc<AtomicUsize>,
+    /// Process groups of the `wl-copy` runs still serving a copied value,
+    /// so a `forget` can end them: a copy that had already started when the
+    /// panel locked would otherwise keep serving the password until its
+    /// own timer ran out, past the lock-time clear.
+    clips: Shared<HashSet<u32>>,
     out: Sender<String>,
 }
 
@@ -119,6 +124,7 @@ fn main() {
         store: Arc::default(),
         runs: Arc::default(),
         detached: Arc::default(),
+        clips: Arc::default(),
         out,
     };
     let mut input = BufReader::new(std::io::stdin().lock());
@@ -246,7 +252,13 @@ impl Helper {
                     stop_group(id, group, Arc::clone(&self.runs));
                 }
             }
-            Request::Forget { keep, .. } => self.store.lock().unwrap().forget(&keep),
+            // The store first, so a copy request already read behind this
+            // one finds nothing; then the copies already serving. Done here,
+            // on the request thread, before the next line is read.
+            Request::Forget { keep, .. } => {
+                self.store.lock().unwrap().forget(&keep);
+                end_copies(&self.clips);
+            }
             Request::HoldSession { name, .. } => {
                 self.store.lock().unwrap().hold_session(name);
             }
@@ -316,7 +328,7 @@ impl Helper {
     fn copy(&self, q: u64, value: Option<Zeroizing<String>>, clear_sec: u32) {
         let copied = value
             .filter(|value| !value.is_empty())
-            .map(|value| copy_to_clipboard(value, clear_sec))
+            .map(|value| copy_to_clipboard(value, clear_sec, Arc::clone(&self.clips)))
             .unwrap_or(false);
         self.result(q, copied.then_some(Value::Bool(true)));
     }
@@ -639,10 +651,17 @@ fn signal_group(group: u32, signal: rustix::process::Signal) {
 }
 
 /// `timeout Ns wl-copy --foreground --sensitive` with the value on stdin: the
-/// copy clears itself after N seconds, even if the shell restarts, and a
-/// newer copy ends it early. In its own process group, so a run's kill
-/// never reaches it.
-fn copy_to_clipboard(value: Zeroizing<String>, clear_sec: u32) -> bool {
+/// copy clears itself after N seconds, even if the shell or this helper
+/// dies (`timeout` is the copy's own, not a timer here), and a newer copy
+/// ends it early. In its own process group, so a run's kill never reaches
+/// it; listed in `clips` so a `forget` does. Always `--foreground`, even
+/// with no expiry: a daemonized `wl-copy` would be nobody's child, and
+/// there would be no process to end at lock time.
+fn copy_to_clipboard(
+    value: Zeroizing<String>,
+    clear_sec: u32,
+    clips: Shared<HashSet<u32>>,
+) -> bool {
     let mut command = if clear_sec > 0 {
         let mut c = Command::new("timeout");
         c.arg(format!("{clear_sec}s"))
@@ -650,7 +669,7 @@ fn copy_to_clipboard(value: Zeroizing<String>, clear_sec: u32) -> bool {
         c
     } else {
         let mut c = Command::new("wl-copy");
-        c.arg("--sensitive");
+        c.args(["--foreground", "--sensitive"]);
         c
     };
     command
@@ -661,15 +680,57 @@ fn copy_to_clipboard(value: Zeroizing<String>, clear_sec: u32) -> bool {
     let Ok(mut child) = command.spawn() else {
         return false;
     };
+    let group = child.id();
+    clips.lock().unwrap().insert(group);
     let Some(mut pipe) = child.stdin.take() else {
         return false;
     };
     let written = pipe.write_all(value.as_bytes()).is_ok();
     drop(pipe);
     thread::spawn(move || {
+        // Off the list before it is reaped, as a run is (see `run`): once
+        // reaped, the group id could be another process's.
+        if let Some(pid) = i32::try_from(group)
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+        {
+            let _ = rustix::process::waitid(
+                rustix::process::WaitId::Pid(pid),
+                rustix::process::WaitIdOptions::EXITED | rustix::process::WaitIdOptions::NOWAIT,
+            );
+        }
+        clips.lock().unwrap().remove(&group);
         let _ = child.wait();
     });
     written
+}
+
+/// Ends every copy still serving: a lock, logout or account switch must
+/// leave nothing of the vault on the clipboard, whatever its timer says.
+/// Signalled with the list locked, so a group listed is still ours. The
+/// compositor drops a selection when its owner goes, so SIGTERM is the
+/// clear; SIGKILL follows for one that did not go.
+fn end_copies(clips: &Shared<HashSet<u32>>) {
+    let groups: Vec<u32> = {
+        let clips = clips.lock().unwrap();
+        for group in clips.iter() {
+            signal_group(*group, rustix::process::Signal::TERM);
+        }
+        clips.iter().copied().collect()
+    };
+    if groups.is_empty() {
+        return;
+    }
+    let clips = Arc::clone(clips);
+    thread::spawn(move || {
+        thread::sleep(STOP_GRACE);
+        let clips = clips.lock().unwrap();
+        for group in groups {
+            if clips.contains(&group) {
+                signal_group(group, rustix::process::Signal::KILL);
+            }
+        }
+    });
 }
 
 #[cfg(test)]

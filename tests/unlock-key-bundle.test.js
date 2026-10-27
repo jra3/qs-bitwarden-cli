@@ -58,8 +58,8 @@ function inTemp(fn) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "qsbw-unlock-bundle-"))
   try { return fn(dir) } finally { fs.rmSync(dir, { recursive: true, force: true }) }
 }
-const inspect = (pluginDir) => {
-  const cmd = Model.unlockKeyInspectCommand(pluginDir)
+const inspect = (pluginDir, allowDevelopment) => {
+  const cmd = Model.unlockKeyInspectCommand(pluginDir, allowDevelopment)
   const run = spawnSync(cmd[0], cmd.slice(1), { encoding: "utf8", env: { PATH: "/usr/bin:/bin" } })
   return Model.parseUnlockKeyInspection(run.stdout)
 }
@@ -90,16 +90,29 @@ check("a sample binary exists to build fixtures from", fs.existsSync(sample),
   "neither a tracked tool nor unlock-key/target/debug -- run `cargo build` in unlock-key/")
 
 if (fs.existsSync(sample)) {
-  // A local build with nothing shipped: the development loop keeps working.
+  // A local build with nothing shipped: the development loop keeps working,
+  // once shell.json (allowDevelopmentHelpers) says it is one.
   inTemp(dir => {
     const target = path.join(dir, "unlock-key", "target", "debug")
     fs.mkdirSync(target, { recursive: true })
     fs.copyFileSync(sample, path.join(target, "qs-bitwarden-unlock-key"))
     fs.chmodSync(path.join(target, "qs-bitwarden-unlock-key"), 0o755)
-    const result = inspect(dir)
+    eq("a development build is not used unless asked for", inspect(dir).state, "missing")
+    const result = inspect(dir, true)
     eq("a development build is usable", result.state, "ok")
     eq("and is identified as such", result.source, "development")
     eq("no checksum is claimed for it", result.checksum, "unchecked")
+  })
+
+  // Shipped with no manifest beside it: not run, and quick unlock stays off.
+  inTemp(dir => {
+    const target = path.join(dir, "bin", "x86_64-linux")
+    fs.mkdirSync(target, { recursive: true })
+    fs.copyFileSync(sample, path.join(target, "qs-bitwarden-unlock-key"))
+    fs.chmodSync(path.join(target, "qs-bitwarden-unlock-key"), 0o755)
+    const result = inspect(dir)
+    eq("a shipped tool without SHA256SUMS is refused", result.state, "checksum-missing")
+    eq("and quick unlock stays off", Model.helperReady(result), false)
   })
 
   // Shipped but stale: its line names other bytes.

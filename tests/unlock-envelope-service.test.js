@@ -41,8 +41,10 @@ check("the only other caller is an enable form, after bw has checked the passwor
   `${callers} occurrences`)
 
 const loginOutput = bodyOf("onLoginOutput")
+// loginSecret() is the field, or a reference to what pinentry took; the name
+// is handed over with it (not forgotten), and the unlock forgets it after.
 check("a login hands its typed password over before clearing it",
-  /pendingUnlockPassword = String\(loginPassword \|\| ""\)\s*\n\s*pendingUnlockFrom = ""\s*\n\s*loginPassword = ""/
+  /pendingUnlockPassword = loginSecret\(\)\s*\n\s*pendingUnlockFrom = ""\s*\n\s*loginMasterName = ""\s*\n\s*loginPassword = ""/
     .test(loginOutput), loginOutput.slice(loginOutput.indexOf("rememberTwoFactorMethod"), 2000))
 check("the writer creates, replaces or rotates, and nothing else",
   /unlockEnvelopeCreateCommand/.test(bodyOf("storeAcceptedMasterPassword"))
@@ -56,11 +58,14 @@ check("the old plaintext fingerprint writer is gone",
 // Enable forms check; they do not store
 // -------------------------------------------------------------------------
 
-const fpSetup = bodyOf("submitFingerprintSetup")
+// The form's submit takes the field (or asks pinentry); saveFingerprintSetup()
+// is the write both reach.
+const fpSubmit = bodyOf("submitFingerprintSetup")
+const fpSetup = bodyOf("saveFingerprintSetup")
 check("fingerprint setup adds a wrap through the master-password check",
   /addQuickUnlockMethod\(typed, \{ kind: "add-fingerprint" \}/.test(fpSetup), fpSetup)
 check("and drops the typed password as soon as it is handed over",
-  /var typed = fpSetupMaster\s*\n\s*fpSetupMaster = ""/.test(fpSetup), fpSetup)
+  /var typed = fpSetupMaster\s*\n\s*fpSetupMaster = ""\s*\n\s*saveFingerprintSetup\(typed\)/.test(fpSubmit), fpSubmit)
 check("a wrong password is named as such",
   /root\.fpError = root\.quickUnlockErrorText\(why,/.test(fpSetup)
     && /why === "wrong-password"\) return "That is not your master password\."/.test(bodyOf("quickUnlockErrorText")), fpSetup)
@@ -202,13 +207,17 @@ check("settings state the floor rule where it applies",
 // -------------------------------------------------------------------------
 
 const pinSetup = bodyOf("submitPinSetup")
+// The form's submit validates the fields (or asks pinentry, which checks the
+// PIN itself); savePinSetup() is the write both reach.
+const pinSave = bodyOf("savePinSetup")
 check("PIN setup adds a wrap through the master-password check, with the PIN in the environment",
-  /addQuickUnlockMethod\(typed, \{ kind: "add-pin" \}, pin,/.test(pinSetup)
-    && /pin\[Model\.pinEnvVar\(\)\] = pinSetupPin/.test(pinSetup), pinSetup)
+  /addQuickUnlockMethod\(typed, \{ kind: "add-pin" \}, pinEnv,/.test(pinSave)
+    && /pinEnv\[Model\.pinEnvVar\(\)\] = pin/.test(pinSave)
+    && /savePinSetup\(typed, pinSetupPin\)/.test(pinSetup), pinSave)
 check("PIN rules: validated first, numeric, the setup floor",
   /Model\.validatePin\(pinSetupPin, pinSetupConfirm\)/.test(pinSetup), pinSetup)
 check("a wrong master password is named as such",
-  /root\.pinError = root\.quickUnlockErrorText\(why,/.test(pinSetup), pinSetup)
+  /root\.pinError = root\.quickUnlockErrorText\(why,/.test(pinSave), pinSave)
 check("the old PIN-blob writer is gone",
   !/pinStoreProc|onPinStored|Model\.pinStoreCommand/.test(service), "still referenced")
 const pinUnlock = bodyOf("submitPinUnlock")
@@ -320,8 +329,8 @@ check("only a setting explicitly false counts as off, never one not loaded yet",
   /settings\[name\] === false/.test(bodyOf("quickUnlockSettingOff")), bodyOf("quickUnlockSettingOff"))
 check("a method just enabled is not taken for off while its setting write lands",
   /quickUnlockEnabledAt\[c\.method\]/.test(reconcile) && /quickUnlockEnableGraceMs/.test(reconcile)
-    && /noteQuickUnlockEnabled\("pin"\)/.test(bodyOf("submitPinSetup"))
-    && /noteQuickUnlockEnabled\("fingerprint"\)/.test(bodyOf("submitFingerprintSetup"))
+    && /noteQuickUnlockEnabled\("pin"\)/.test(bodyOf("savePinSetup"))
+    && /noteQuickUnlockEnabled\("fingerprint"\)/.test(bodyOf("saveFingerprintSetup"))
     && /noteQuickUnlockEnabled\("fido"\)/.test(fidoSrc),
   reconcile)
 check("a method that is off is purged even with no envelope entry for it, which clears its legacy entry",

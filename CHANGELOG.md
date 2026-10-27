@@ -4,6 +4,21 @@
 
 ### Security
 
+- **The master password is typed into pinentry on every screen, and a new
+  PIN too.** The email and API-key login's master password, and the master
+  password confirmed when turning on PIN, fingerprint or FIDO2 unlock, went
+  into the panel's own fields, so a shell crash after one of those could
+  leave them in the shell's core dump (the unlock and re-prompt already used
+  pinentry). They now go through the same pinentry under the vault helper,
+  which holds each under a name and feeds it to `bw login`, the FIFO writer
+  or the envelope tool itself; the shell learns only whether you answered. A
+  new PIN is typed twice in one pinentry window and checked there (length,
+  digits, match); a pinentry that cannot take a repeat is refused rather than
+  trusted, and the panel offers its fields. "Type it here instead" works as
+  before: only on your choice, and never remembered. Nothing changes with
+  pinentry off or missing. Requires no helper rebuild: the helper's existing
+  named-secret capture and injection carry it.
+
 - **Locking ends the copies still on the clipboard.** The vault helper hands
   a copied password to `wl-copy` with a timed clear, but a copy that had
   started just before a lock kept serving the password until its own timer

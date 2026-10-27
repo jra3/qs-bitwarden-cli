@@ -17,8 +17,8 @@ The [README](../README.md#how-your-vault-is-held) has the short version.
 | The item list | every item in full | names, usernames, websites, folders, flags such as "has a password" |
 | Passwords, TOTP keys, passkeys, password history, notes, card numbers and codes, identity numbers, hidden custom fields | yes | only a value you reveal, while it is revealed; the whole item while you edit it |
 | The master password a PIN, fingerprint or FIDO2 key opens | yes, for that unlock | a reference by name |
-| What you type: the master password and PIN for unlocking, and the master password for a re-prompt | yes: typed into pinentry, a separate process, and passed to the helper | a reference by name |
-| What else you type: the email login, the master password and new PIN when setting up PIN, fingerprint or FIDO2 unlock, and an item's fields | | yes, until you submit, and in memory after |
+| What you type: the master password for unlocking, for a re-prompt, for the email and API-key login and when setting up PIN, fingerprint or FIDO2 unlock; the PIN for unlocking; the new PIN | yes: typed into pinentry, a separate process, and passed to the helper | a reference by name |
+| What else you type: the login email, an API key's client id and secret, two-step and device codes, and an item's fields | | yes, until you submit, and in memory after |
 
 Opening an item shows its name, username, websites, card brand, holder and
 expiry, identity name, email, address and phone, plain custom fields and
@@ -79,17 +79,35 @@ output is handed back as it is, except:
 ## Typing into pinentry
 
 A string typed into the panel stays in the shell's memory after the field is
-cleared, so a shell core dump could hold it. The master password for
-unlocking and for a re-prompt, and the PIN, are therefore typed into
-`pinentry`, a separate process. The panel hides while it runs so it can take
-the keyboard, and shows again after.
+cleared, so a shell core dump could hold it. The master password, wherever
+the panel asks for it (unlocking, a re-prompt, the email or API-key login, and
+the confirmation when setting up PIN, fingerprint or FIDO2 unlock), the PIN,
+and a new PIN are therefore typed into `pinentry`, a separate process. The
+panel hides while it runs so it can take the keyboard, and shows again after.
 
 The helper runs a small script that speaks the pinentry protocol, and keeps
 what it prints, decoded, under a name; the shell only learns whether you
-answered or cancelled. The held password or PIN goes to `bw unlock`, the
-quick-unlock check or the re-prompt check by name, and is forgotten as soon as
-that has finished. A wrong password or PIN opens pinentry again with the
-reason.
+answered or cancelled. The held password or PIN goes to `bw unlock`,
+`bw login`, the quick-unlock check or the re-prompt check by name, and is
+forgotten as soon as that has finished. A wrong password or PIN opens pinentry
+again with the reason.
+
+A login keeps its name for the whole attempt: a two-step code, a new-device
+code and a retry of the password writer all send the same held password, and
+you are not asked for it again until the attempt ends (accepted, refused, or
+abandoned by closing the panel outside the second-factor window). The
+password `bw login` and `bw unlock` read from their FIFO is written by a
+small script that runs under the helper too, with the held password in its
+own environment: the shell asks for the write by name and never has the
+value.
+
+A new PIN is typed twice in the one pinentry window (its "Repeat" field), and
+pinentry itself refuses a pair that does not match. The script also checks
+the length floor and that it is all digits, as the panel's fields would, and
+asks again on a miss. A pinentry that cannot take a repeat (`pinentry-tty`,
+and older `pinentry-curses`) answers after one entry; since nothing confirmed
+what was typed, that PIN is not kept, and the panel says so and offers its
+fields.
 
 Pinentry closes itself after two minutes without an answer, which counts as
 a cancel.
@@ -155,8 +173,8 @@ what `pinentry` on your `PATH` runs; on some systems (Arch among them) it is a
 script that picks `pinentry-gnome3`. Set `pinentryProgram` to name a pinentry
 yourself.
 
-The email login, the setup of PIN, fingerprint and FIDO2 unlock (the master
-password and the new PIN) and the item forms are not covered.
+The item forms, the login email, an API key's client id and secret, and the
+two-step and new-device codes are not covered: they are typed into the panel.
 
 ## Hardening
 
@@ -183,9 +201,10 @@ other way, such as `gcr-prompter` for `pinentry-gnome3`
   `bw` command runs. That was true before the helper and is true of `bw`
   everywhere; see [SECURITY.md](../SECURITY.md) for what is in scope.
 - **What is on screen, and what you type, is in the shell.** That is what you
-  type into the panel's own fields (the email login, item fields, quick-unlock
-  setup, and the master password or PIN when pinentry is not used). Clearing it does not wipe
-  it, so it can stay in the shell's memory and be in a shell core dump.
+  type into the panel's own fields (the login email, API-key fields, two-step
+  and device codes, item fields, and the master password or PIN when pinentry
+  is not used). Clearing it does not wipe it, so it can stay in the shell's
+  memory and be in a shell core dump.
 - **The shell's core dumps are left on.** The plugin does not lower the
   shell's core-file limit. The limit is per process and inherited, so it would
   also turn off core dumps for every other plugin in the shell and for every

@@ -299,7 +299,8 @@ check("a PIN-requiring registration gets a reason, not a failed touch",
 check("setup is a master-password check and one touch, through the vault's shared path",
   /vault\.addQuickUnlockMethodWith\(typed, function\(tool, account\) \{\s*return Model\.fidoEnrollCommand\(tool, account, target\)/
     .test(controllerSrc)
-    && /var typed = setupMaster\s*\n\s*setupMaster = ""/.test(controllerSrc), "")
+    // The field, or the reference the vault's pinentry flow hands in.
+    && /var typed = String\(master \|\| setupMaster \|\| ""\)\s*\n\s*setupMaster = ""/.test(controllerSrc), "")
 check("a wrap whose setup was abandoned, locked or logged out mid-write is removed",
   /vault\.epochOperationIsStale\("fidoAdd"\) \|\| !setupActive\)[\s\S]{0,200}?removeQuickUnlockMethod\(\{ kind: "remove", method: "fido", cred: target\.cred \}\)/
     .test(controllerSrc)

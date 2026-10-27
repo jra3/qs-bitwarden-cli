@@ -9,9 +9,13 @@
 #   error        ERR 83886360, a failure that is not a cancel
 #   crash        exits without answering
 #   hang         never answers (until it is killed)
-# Every SETDESC, SETERROR, SETPROMPT, SETTIMEOUT and SETTITLE is appended to
-# $FAKE_PINENTRY_LOG as it arrived (the PIN never is), each start as "start",
-# and a held: answer's release as "released".
+# A SETREPEAT makes every pin: answer say `S PIN_REPEATED` first, as a
+# pinentry that took the answer twice and matched them does; with
+# $FAKE_PINENTRY_NO_REPEAT set it is a pinentry that cannot (it answers OK to
+# SETREPEAT and says nothing of it).
+# Every SETDESC, SETERROR, SETPROMPT, SETREPEAT, SETREPEATERROR, SETTIMEOUT
+# and SETTITLE is appended to $FAKE_PINENTRY_LOG as it arrived (the PIN never
+# is), each start as "start", and a held: answer's release as "released".
 log() { [ -z "${FAKE_PINENTRY_LOG:-}" ] || printf '%s\n' "$1" >> "$FAKE_PINENTRY_LOG"; }
 next_answer() {
   local f="${FAKE_PINENTRY_ANSWERS:-}" first
@@ -20,20 +24,23 @@ next_answer() {
   tail -n +2 "$f" > "$f.next" && mv "$f.next" "$f"
   printf '%s' "$first"
 }
+repeat=0
+repeated() { [ "$repeat" = 1 ] && [ -z "${FAKE_PINENTRY_NO_REPEAT:-}" ] && echo "S PIN_REPEATED"; return 0; }
 log start
 echo "OK Pleased to meet you"
 while IFS= read -r line; do
   case "$line" in
-    SETTITLE*|SETDESC*|SETPROMPT*|SETERROR*|SETTIMEOUT*) log "$line"; echo OK ;;
+    SETREPEAT*) repeat=1; log "$line"; echo OK ;;
+    SETTITLE*|SETDESC*|SETPROMPT*|SETERROR*|SETREPEATERROR*|SETTIMEOUT*) log "$line"; echo OK ;;
     GETPIN)
       log GETPIN
       answer="$(next_answer)"
       case "$answer" in
-        pin:*) printf 'D %s\nOK\n' "${answer#pin:}" ;;
+        pin:*) repeated; printf 'D %s\nOK\n' "${answer#pin:}" ;;
         held:*)
           while [ ! -e "${FAKE_PINENTRY_RELEASE:-/nonexistent}" ]; do sleep 0.1; done
           log released
-          printf 'D %s\nOK\n' "${answer#held:}" ;;
+          repeated; printf 'D %s\nOK\n' "${answer#held:}" ;;
         empty) echo OK ;;
         timeout) echo "ERR 83886142 Timeout <Pinentry>" ;;
         error) echo "ERR 83886360 Unexpected error <Pinentry>" ;;

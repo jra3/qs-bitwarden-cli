@@ -313,18 +313,19 @@ check("a newer session waits for an old store and its cleanup before being remem
 // A PIN is now a wrap in the envelope, and the invariant carries over: a wrap
 // written for a vault generation that has ended, or a form that was left, is
 // taken back out when it lands.
+// The write is savePinSetup(), reached from the form's fields or from pinentry.
 check("a PIN wrap cannot outlive the lock or abandonment it raced",
-  /beginEpochOperation\("pinAdd"\)/.test(bodyOf("submitPinSetup"))
+  /beginEpochOperation\("pinAdd"\)/.test(bodyOf("savePinSetup"))
     && /epochOperationIsStale\("pinAdd"\)[\s\S]{0,300}?removeQuickUnlockMethod\(\{ kind: "remove", method: "pin" \}\)/
-      .test(bodyOf("submitPinSetup")),
-  bodyOf("submitPinSetup"))
+      .test(bodyOf("savePinSetup")),
+  bodyOf("savePinSetup"))
 // A fingerprint wrap written for a vault generation that ended (or an
 // abandoned setup) is removed again.
 check("a fingerprint wrap cannot outlive the lock or abandonment it raced",
-  /beginEpochOperation\("fingerprintAdd"\)/.test(bodyOf("submitFingerprintSetup"))
+  /beginEpochOperation\("fingerprintAdd"\)/.test(bodyOf("saveFingerprintSetup"))
     && /epochOperationIsStale\("fingerprintAdd"\)[\s\S]{0,300}?removeQuickUnlockMethod\(\{ kind: "remove", method: "fingerprint" \}\)/
-      .test(bodyOf("submitFingerprintSetup")),
-  bodyOf("submitFingerprintSetup"))
+      .test(bodyOf("saveFingerprintSetup")),
+  bodyOf("saveFingerprintSetup"))
 // And logout: the queue is emptied, and the final clear waits for a write
 // already running rather than racing it.
 check("logout drops queued envelope work and waits for a running write",

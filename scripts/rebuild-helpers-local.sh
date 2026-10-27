@@ -22,6 +22,8 @@ set -o pipefail
 set -u
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# All scratch space lives inside the checkout, never in /tmp or ~/.cache.
+STATE_DIR="$REPO_ROOT/.rebuild-helpers"
 BUILD_SCRIPT="$REPO_ROOT/scripts/build-agent.sh"
 OUTPUT_ARCH="x86_64-linux"
 
@@ -40,9 +42,9 @@ Usage: scripts/rebuild-helpers-local.sh [compare|write|verify|test] [--ref <rev>
   --ref     Build this commit instead of HEAD.
 
 Needs docker (or passwordless `sudo docker`) and the network, for the image
-pull and the crate registry. The registry is cached under
-$XDG_CACHE_HOME/qs-bitwarden-cli/cargo-registry (default ~/.cache) so later
-runs download nothing after the first; delete it to start clean.
+pull and the crate registry. Everything is written under .rebuild-helpers/ in
+this checkout (ignored by git): the temporary clone, removed on exit, and the
+registry cache, kept so later runs download nothing; delete it to start clean.
 USAGE
 }
 
@@ -88,7 +90,8 @@ main() {
   # whatever shape the checkout outside it has. The temporary directory is
   # the only host path the container sees besides the registry cache.
   local work
-  work="$(mktemp -d)" || fail "could not create a work directory"
+  mkdir -p "$STATE_DIR" || fail "could not create $STATE_DIR"
+  work="$(mktemp -d "$STATE_DIR/work.XXXXXX")" || fail "could not create a work directory"
   # shellcheck disable=SC2064
   trap "rm -rf '$work'" EXIT
   git clone -q --no-checkout "$REPO_ROOT" "$work/repo" || fail "could not clone $REPO_ROOT"
@@ -107,7 +110,7 @@ main() {
   # The registry cache is a host directory rather than a docker volume: a
   # volume is created root-owned, which the unprivileged build cannot write.
   # Its paths are remapped out of the binary by build-agent.sh.
-  local cache="${XDG_CACHE_HOME:-$HOME/.cache}/qs-bitwarden-cli/cargo-registry"
+  local cache="$STATE_DIR/cargo-registry"
   mkdir -p "$cache" || fail "could not create $cache"
   printf 'root:x:0:0:root:/root:/bin/bash\nbuild:x:%s:%s:build:/work:/bin/bash\n' \
     "$(id -u)" "$(id -g)" > "$work/passwd" || fail "could not write a passwd file"

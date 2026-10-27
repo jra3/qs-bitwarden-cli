@@ -118,7 +118,9 @@ check("the IPC target is claimed only by a live vault",
   /IpcHandler \{\s*target: "io\.github\.elevate08\.qs-bitwarden-cli"\s*enabled: root\.live/.test(service),
   "IpcHandler must be enabled only while live")
 check("nothing starts itself in an unattached vault",
-  /running: root\.live && root\.lockOnSuspend/.test(service)
+  // The logind monitor runs for every live vault (it locks at shutdown
+  // whatever the settings say), gated on live alone.
+  /id: sleepMonitorProc\s+running: root\.live\s*$/m.test(service)
     && /running: root\.live && !root\.statusProbeStarted/.test(service),
   "self-starting processes and timers must be gated on live")
 // Every other declarative `running:` must depend on state an inert vault never

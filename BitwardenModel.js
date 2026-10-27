@@ -1171,7 +1171,13 @@ function screenLockPollMs() {
 // only on exit, so each loop iteration takes a fresh one. The monitor is
 // killed by pid once sed matches; waiting for a broken pipe would hold the
 // inhibitor until the next signal, which is the resume.
+// Shutdown and reboot are the same shape: PrepareForShutdown(true), under a
+// shutdown delay inhibitor. Nothing else locks then: the shell is killed
+// rather than unloaded, so Component.onDestruction never runs, and a
+// remembered session's keyring copy dies with the secret service while the
+// key it holds stays valid in bw's data until `bw lock`.
 var SLEEP_SIGNAL_TOKEN = "sleep"
+var SHUTDOWN_SIGNAL_TOKEN = "shutdown"
 var WAKE_SIGNAL_TOKEN = "wake"
 // What the panel writes to the monitor's stdin once `bw lock` (and the
 // keyring clear) has finished.
@@ -1182,6 +1188,7 @@ var SLEEP_ACK_TOKEN = "ack"
 var SLEEP_ACK_TIMEOUT_S = 4
 
 function sleepSignalToken() { return SLEEP_SIGNAL_TOKEN }
+function shutdownSignalToken() { return SHUTDOWN_SIGNAL_TOKEN }
 function wakeSignalToken() { return WAKE_SIGNAL_TOKEN }
 function sleepAckLine() { return SLEEP_ACK_TOKEN + "\n" }
 function sleepAckTimeoutS() { return SLEEP_ACK_TIMEOUT_S }
@@ -1191,8 +1198,10 @@ function sleepMonitorCommand() {
     + " --object-path /org/freedesktop/login1 2>/dev/null"
 
   // -u so the match leaves sed the moment it is read, rather than sitting in a
-  // block buffer until after the machine has already suspended.
-  var match = "sed -une '/PrepareForSleep (true,/{s/.*/x/p;q}'"
+  // block buffer until after the machine has already suspended. Each match
+  // prints its token, so the panel learns which one it was.
+  var match = "sed -une '/PrepareForSleep (true,/{s/.*/" + SLEEP_SIGNAL_TOKEN + "/p;q}; "
+    + "/PrepareForShutdown (true,/{s/.*/" + SHUTDOWN_SIGNAL_TOKEN + "/p;q}'"
 
   // stdin is the ack pipe (fd 4 below). Acks left from an earlier cycle are
   // drained before the token goes out, so only this cycle's ack can end the
@@ -1203,8 +1212,10 @@ function sleepMonitorCommand() {
     // gdbus ended without a sleep: not a resume, so no wake token.
     + "[ -n \"$m\" ] || exit 1; "
     + "while read -r -t 0.05 _; do :; done; "
-    + "echo " + shellQuote(SLEEP_SIGNAL_TOKEN) + "; "
-    + "read -r -t " + SLEEP_ACK_TIMEOUT_S + " _; exit 0"
+    + "printf '%s\\n' \"$m\"; "
+    + "read -r -t " + SLEEP_ACK_TIMEOUT_S + " _; "
+    // Only a sleep has a resume to report.
+    + "[ \"$m\" = " + SLEEP_SIGNAL_TOKEN + " ]"
 
   // Never exits on its own; failures wait before retrying so it cannot spin.
   // Quickshell kills only its direct child on reload, so a watcher on stdin
@@ -1218,9 +1229,9 @@ function sleepMonitorCommand() {
     + shellQuote(SLEEP_ACK_TOKEN) + " >&4; done; kill -KILL -- -$$) <&0 & "
     + "while :; do "
     + "command -v gdbus >/dev/null 2>&1 || { sleep 300; continue; }; "
-    + "if systemd-inhibit --what=sleep --mode=delay"
+    + "if systemd-inhibit --what=sleep:shutdown --mode=delay"
     + " --who=" + shellQuote("Bitwarden")
-    + " --why=" + shellQuote("Locking the vault before sleep")
+    + " --why=" + shellQuote("Locking the vault before sleep or shutdown")
     + " bash -c " + shellQuote(inner) + " <&4; then "
     // Resume. Reported once the inhibitor is gone, since nothing waits on it.
     + "echo " + shellQuote(WAKE_SIGNAL_TOKEN) + "; "
@@ -1643,20 +1654,69 @@ function deleteItemCommand(itemId, typeCode) {
 // Remembered session
 // -------------------------------------------------------------------------
 //
-// The session token must not survive a reboot. It is stored in libsecret's
-// in-memory `session` collection where available (falling back to the
-// default), and prefixed with the kernel boot id, so a token from another
-// boot is refused and cleared. Every failure reads as "no token".
+// The session token must not survive a reboot, and must not reach disk at
+// all. It is stored only in libsecret's in-memory `session` collection, and
+// prefixed with the kernel boot id, so a token from another boot is refused
+// and cleared. It used to fall back to the default collection when the
+// session one refused the write; on Omarchy that collection is a plaintext
+// file under ~/.local/share/keyrings, so a secret service without a session
+// collection put the raw key on disk, where the boot-id check (the panel's
+// alone; `bw` accepts the key until `bw lock`) protects nothing. Now the
+// store fails instead, and the panel says the session was not remembered.
+// A lookup failure still reads as "no token".
 const KEYRING_SESSION_COLLECTION = "session"
+// Where the session collection's items live on the bus. `secret-tool store
+// --collection=session` is asked for, but what libsecret did is checked here:
+// an item anywhere else is removed again.
+const KEYRING_SESSION_ITEM_PREFIX = "/org/freedesktop/secrets/collection/session/"
 const BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
 
+// keyringStoreCommand()'s exit codes past 0 and secret-tool's own 1.
+// The session collection refused the write (none, or the service is down).
+const KEYRING_STORE_UNAVAILABLE = 2
+// The write was accepted but the item is not in the session collection: it
+// has been removed again.
+const KEYRING_STORE_MISPLACED = 3
+// The write was accepted but the check could not see the item (a search
+// that failed or found nothing); any item is removed, to be safe.
+const KEYRING_STORE_UNVERIFIED = 4
+
+function keyringStoreUnavailableCode() { return KEYRING_STORE_UNAVAILABLE }
+function keyringStoreMisplacedCode() { return KEYRING_STORE_MISPLACED }
+function keyringStoreUnverifiedCode() { return KEYRING_STORE_UNVERIFIED }
+
+// Lists where the entry's items are: one item path per line, from
+// `secret-tool search`, whose other lines (the secret among them) are
+// dropped before anything is captured. Fails if the search did.
+function keyringItemPathsScript(account, resultVar) {
+  var attrs = keyringAttributes(account)
+  return resultVar + "=$(secret-tool search --all" + attrs
+    + " 2>/dev/null | grep '^\\[/' | head -c 65536; "
+    + "__keyring_pipe=(\"${PIPESTATUS[@]}\"); "
+    + "printf '\\n:%s' \"${__keyring_pipe[0]}\"); "
+}
+
 function keyringStoreCommand(slot) {
-  var attrs = keyringAttributes(keyringEntryName(KEYRING_ACCOUNT, slot))
+  var account = keyringEntryName(KEYRING_ACCOUNT, slot)
+  var attrs = keyringAttributes(account)
   // Only the boot id is read in the script; the token comes from the env.
-  var script = "store() { printf '%s %s' \"$(cat " + shellQuote(BOOT_ID_PATH) + ")\" \"$"
-    + KEYRING_SECRET_ENV + "\" | secret-tool store \"$@\" --label="
-    + shellQuote("Bitwarden Vault Session") + attrs + "; }; "
-    + "store --collection=" + shellQuote(KEYRING_SESSION_COLLECTION) + " 2>/dev/null || store"
+  var script = "printf '%s %s' \"$(cat " + shellQuote(BOOT_ID_PATH) + ")\" \"$"
+    + KEYRING_SECRET_ENV + "\" | secret-tool store --collection="
+    + shellQuote(KEYRING_SESSION_COLLECTION) + " --label="
+    + shellQuote("Bitwarden Vault Session") + attrs + " >/dev/null 2>&1 "
+    + "|| exit " + KEYRING_STORE_UNAVAILABLE + "; "
+    + keyringItemPathsScript(account, "__keyring_items")
+    + "__keyring_search_rc=${__keyring_items##*:}; "
+    // Through $(...), which drops the trailing newline a non-empty list has.
+    + "__keyring_paths=$(printf '%s' \"${__keyring_items%:*}\"); "
+    + "__keyring_rc=0; "
+    + "if [ \"$__keyring_search_rc\" -ne 0 ] || [ -z \"$__keyring_paths\" ]; then __keyring_rc="
+    + KEYRING_STORE_UNVERIFIED + "; "
+    // Every item must be in the session collection, not only one of them.
+    + "elif printf '%s\\n' \"$__keyring_paths\" | grep -qv '^\\[" + KEYRING_SESSION_ITEM_PREFIX
+    + "'; then __keyring_rc=" + KEYRING_STORE_MISPLACED + "; fi; "
+    + "if [ \"$__keyring_rc\" -ne 0 ]; then secret-tool clear" + attrs + " >/dev/null 2>&1; fi; "
+    + "exit \"$__keyring_rc\""
   return ["bash", "-c", script]
 }
 
@@ -1673,16 +1733,27 @@ function keyringLookupCommand(slot) {
   return ["bash", "-c", cappedScript(script)]
 }
 
-// Exits 0 only once no session entry is left: `secret-tool clear` exits 1
-// when nothing matched and skips locked matches, so its own status says
-// nothing either way. The check searches without unlocking (no keyring
+// Exits 0 only once no session entry is seen to be left: `secret-tool clear`
+// exits 1 when nothing matched and skips locked matches, so its own status
+// says nothing either way. The check searches without unlocking (no keyring
 // prompt) and counts the output rather than capturing it, since it contains
-// the secret.
+// the secret. The search's own status is kept: with the secret service
+// down, a search prints nothing and the count alone read as "gone", so an
+// entry that came back with the service was reported cleared.
+const KEYRING_CLEAR_LEFT = 1
+const KEYRING_CLEAR_UNKNOWN = 2
+
+function keyringClearUnknownCode() { return KEYRING_CLEAR_UNKNOWN }
+
 function keyringClearCommand(slot) {
-  var attrs = keyringAttributes(keyringEntryName(KEYRING_ACCOUNT, slot))
+  var account = keyringEntryName(KEYRING_ACCOUNT, slot)
+  var attrs = keyringAttributes(account)
   var script = "secret-tool clear" + attrs + " >/dev/null 2>&1; "
-    + "__left=$(secret-tool search" + attrs + " 2>/dev/null | wc -c | tr -d '[:space:]'); "
-    + "[ \"${__left:-0}\" = 0 ]"
+    + keyringSearchStateScript(account, "__keyring_after")
+    + "__keyring_count=${__keyring_after%%:*}; "
+    + "__keyring_search_rc=${__keyring_after##*:}; "
+    + "if [ \"$__keyring_search_rc\" -ne 0 ]; then exit " + KEYRING_CLEAR_UNKNOWN + "; fi; "
+    + "[ \"${__keyring_count:-0}\" = 0 ] || exit " + KEYRING_CLEAR_LEFT
   return ["bash", "-c", script]
 }
 

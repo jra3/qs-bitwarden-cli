@@ -852,6 +852,13 @@ Item {
   property int associationsReadEpoch: -1
   property bool sessionStorePending: false
   property bool sessionClearPending: false
+  // The session key is in the keyring's memory-only collection, checked
+  // there after the store: only then will a shell restart reopen the vault,
+  // so only then may an unload leave the session valid in bw.
+  property bool sessionRemembered: false
+  // Why the last store did not remember the session, for the settings row;
+  // "" once one has.
+  property string rememberSessionProblem: ""
   // Which account's session the running store writes, and the accounts
   // whose session clears wait behind a running one: a switch can land
   // between a request and its run.
@@ -2424,7 +2431,11 @@ Item {
   // With the session not remembered, nothing will reopen it, so an unload
   // while unlocked (a shell restart, the plugin removed) must not leave it
   // valid in bw's data: lock it. Detached, since this shell is going away.
-  // With it remembered, keeping it is the point of the setting.
+  // With it remembered, keeping it is the point of the setting -- but only
+  // when the keyring copy is known to be there (sessionRemembered): with the
+  // setting on and the store refused, the key would otherwise stay valid in
+  // bw with no copy anywhere to reopen the panel. Shutdown and reboot are
+  // not unloads (the shell is killed); the logind monitor locks for those.
   // The shell is unloading: the helper's exit is expected, and it stops (its
   // runs killed, its memory wiped) rather than waiting for its stdin to close.
   function releaseVaultHelper() {
@@ -2433,7 +2444,7 @@ Item {
   }
 
   function lockSessionOnUnload() {
-    if (!session || rememberSession) return
+    if (!session || (rememberSession && sessionRemembered)) return
     if (vaultHelperActive) {
       // The helper holds the key: it starts the lock, detached, before it goes.
       var inject = {}
@@ -3520,6 +3531,9 @@ Item {
       // has reads to invalidate.
       if (session && session !== token) vaultEpoch += 1
       session = token
+      // Read back from the keyring, so a copy is there: an unload may leave
+      // the session to it again.
+      sessionRemembered = true
     }
     runStatusCheck()
     // A remembered session is usually still good, so read the list alongside
@@ -4334,9 +4348,33 @@ Item {
       return
     }
     sessionStorePending = false
-    if (exitCode !== 0) {
-      console.warn("qs-bitwarden-cli: could not store session in keyring (exit " + exitCode + ")")
+    if (exitCode === 0) {
+      sessionRemembered = true
+      rememberSessionProblem = ""
+      return
     }
+    // The store does not fall back to a disk-backed collection, and removes
+    // an item that landed in one (keyringStoreCommand() in BitwardenModel.js),
+    // so a failure means the session is not remembered: a shell restart
+    // asks for the password again, and an unload locks (lockSessionOnUnload()).
+    sessionRemembered = false
+    rememberSessionProblem = sessionStoreProblemText(exitCode)
+    console.warn("qs-bitwarden-cli: the session was not remembered (exit " + exitCode + "): "
+      + rememberSessionProblem)
+    errorMessage = "Session not remembered: " + rememberSessionProblem
+      + " You stay unlocked until a lock or a shell restart."
+  }
+
+  function sessionStoreProblemText(exitCode) {
+    if (exitCode === Model.keyringStoreMisplacedCode()) {
+      return "The OS keyring put the session key outside its memory-only session collection "
+        + "(on disk, possibly), so the key was removed from it again."
+    }
+    if (exitCode === Model.keyringStoreUnverifiedCode()) {
+      return "The OS keyring accepted the session key but could not show where it put it, "
+        + "so the key was removed from it again."
+    }
+    return "The OS keyring has no memory-only session collection, or is not running."
   }
 
   // Runs the next clear or store that waited behind the keyring processes.
@@ -4362,6 +4400,8 @@ Item {
       return
     }
     sessionClearPending = false
+    // Whatever the clear finds, the copy is no longer counted on.
+    if (target === activeSlot) sessionRemembered = false
     sessionClearRun = { slot: target, attempt: attempt || 1 }
     keyringClearProc.command = Model.keyringClearCommand(target)
     keyringClearProc.running = true
@@ -4380,7 +4420,14 @@ Item {
       return
     }
     sessionClearRun = null
-    if (run && exitCode !== 0) {
+    if (run && exitCode === Model.keyringClearUnknownCode()) {
+      // The search failed (secret service down), so nothing is known: the
+      // entry may still be there once the service is back.
+      console.warn("qs-bitwarden-cli: the OS keyring could not be checked after clearing the remembered session (exit "
+        + exitCode + ")")
+      errorMessage = "Could not check that the remembered session left the OS keyring (the keyring did not answer). "
+        + "Lock again to retry; after a reboot it is refused either way."
+    } else if (run && exitCode !== 0) {
       console.warn("qs-bitwarden-cli: the remembered session is still in the keyring after two clears (exit "
         + exitCode + ")")
       errorMessage = "Could not remove the remembered session from the OS keyring. "
@@ -5332,7 +5379,14 @@ Item {
   // fingerprint on (no secret involved) a PIN or key adds nothing, and those
   // rows say so.
   function settingNote(entry) {
-    if (!entry || (entry.key !== "pinUnlock" && entry.key !== "fidoUnlock")) return ""
+    if (!entry) return ""
+    // The last store refused: the setting is on but doing nothing.
+    if (entry.key === "rememberSession") {
+      if (!rememberSession || !rememberSessionProblem) return ""
+      return "Not in effect: " + rememberSessionProblem
+        + " The session is not stored, so a shell restart asks for your password."
+    }
+    if (entry.key !== "pinUnlock" && entry.key !== "fidoUnlock") return ""
     if (!settingValue(entry) || !fingerprintUnlock || !fingerprintStored) return ""
     return "Fingerprint unlock is also on, so the stored password is only as protected as "
       + "fingerprint unlock: a program running as you can open it without the "
@@ -6398,6 +6452,7 @@ Item {
     genBusy = false
     pendingUnlockPassword = ""
     sessionStorePending = false
+    sessionRemembered = false
     dropVaultSecrets()
   }
 
@@ -8339,6 +8394,19 @@ Item {
       if (opened) refreshStatus()
       return
     }
+    // Shutdown or reboot: the session must not outlive the boot, whatever
+    // the settings say, since the shell is killed rather than unloaded and a
+    // remembered key stays valid in bw until `bw lock`.
+    if (token === Model.shutdownSignalToken()) {
+      if (status !== "unlocked") {
+        ackSleep()
+        return
+      }
+      suspendLockPending = true
+      lockVault()
+      maybeAckSleep()
+      return
+    }
     if (token !== Model.sleepSignalToken()) return
     if (!lockOnSuspend || status !== "unlocked") {
       ackSleep()
@@ -8594,11 +8662,13 @@ Item {
     onTriggered: root.applySshAgentEvent({ kind: "restartTimer", nowMs: Date.now() })
   }
 
-  // Holds the sleep inhibitor, so it runs whenever the setting is on, not only
-  // while unlocked (it must already be listening when suspend is announced).
+  // Holds the sleep and shutdown inhibitors, so it runs all the time, not
+  // only while unlocked (it must already be listening when suspend or
+  // shutdown is announced). lockOnSuspend decides what a sleep does
+  // (onSleepSignal()); a shutdown locks regardless.
   Process {
     id: sleepMonitorProc
-    running: root.live && root.lockOnSuspend
+    running: root.live
     // Closing this pipe tears down the monitor's entire process group.
     stdinEnabled: true
     command: Model.sleepMonitorCommand()
@@ -9542,6 +9612,8 @@ Item {
         fidoReady: root.fidoReady,
         fingerprintScanning: root.fingerprintScanning,
         fidoScanning: root.fidoScanning,
+        // Whether a shell restart would reopen the vault from the keyring.
+        sessionRemembered: root.sessionRemembered,
         views: views
       })
     }

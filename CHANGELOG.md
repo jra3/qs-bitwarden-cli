@@ -2,6 +2,32 @@
 
 ## [Unreleased]
 
+### Security
+
+- **A remembered session no longer falls back to the on-disk keyring.** With
+  `rememberSession` on, the session key was written to libsecret's
+  memory-only `session` collection, and when that store failed (a secret
+  service without one, D-Bus trouble) to the default collection instead,
+  which on Omarchy is a plaintext file under `~/.local/share/keyrings`. The
+  boot-id stamp is checked by the panel alone; `bw` accepts the key from that
+  file until `bw lock`. The store now goes only to the session collection,
+  is checked afterwards (an item that landed anywhere else is removed again),
+  and a refusal leaves the session unremembered, with a message and a note
+  on the settings row saying why.
+- **The vault locks at shutdown and reboot.** The shell is killed then, not
+  unloaded, so the unload-time `bw lock` never ran, and a remembered
+  session's key stayed valid in `bw` after the keyring's memory-only copy
+  was gone. The logind monitor that handles suspend now also takes
+  `PrepareForShutdown`, under a shutdown delay inhibitor, and locks whatever
+  `lockOnSuspend` and `rememberSession` say; it runs whenever the plugin
+  does. An unload while unlocked now locks unless a checked keyring copy
+  will reopen the session.
+- **A keyring clear that could not be checked is no longer reported as
+  done.** The clear's check counted the output of a `secret-tool search`
+  and dropped its status, so a secret service that was not answering read
+  as "nothing left"; the entry could come back with the service. The search
+  status is kept, and such a clear is reported as unchecked.
+
 ### Changed
 
 - **The helpers can be rebuilt from a linked worktree.**

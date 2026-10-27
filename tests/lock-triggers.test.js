@@ -65,6 +65,17 @@ check("a delay inhibitor is held so the lock lands before the freeze",
   sleepScript.includes("--what=sleep") && sleepScript.includes("--mode=delay"),
   sleepScript)
 
+// A shutdown or reboot kills the shell rather than unloading it, and a
+// remembered session's key stays valid in bw until `bw lock`; this is the
+// only hook that runs before the boot ends.
+check("shutdown and reboot are taken from logind's PrepareForShutdown",
+  sleepScript.includes("PrepareForShutdown (true,"), sleepScript)
+check("the same delay inhibitor covers shutdown",
+  sleepScript.includes("--what=sleep:shutdown"), sleepScript)
+check("the two announcements reach the panel as different tokens",
+  Model.shutdownSignalToken() !== Model.sleepSignalToken()
+    && Model.shutdownSignalToken() !== Model.wakeSignalToken(), Model.shutdownSignalToken())
+
 // sed quits on the match, but the monitor would then keep the pipeline open
 // until it next wrote -- which is on the far side of the suspend. Killing it
 // is what lets the inhibitor be released and the loop come round again.
@@ -90,8 +101,15 @@ const log = path.join(work, "inhibit.log")
 // Real gdbus is a single process, so the stub execs its wait rather than
 // backgrounding it -- otherwise the stub would leak a child that the real
 // thing does not have.
+// With STUB_SHUTDOWN set it announces a shutdown instead, as logind does
+// (the WithMetadata form beside it, as systemd 255+ sends both).
 fs.writeFileSync(path.join(work, "gdbus"), `#!/bin/bash
 echo "Monitoring signals on object /org/freedesktop/login1 owned by org.freedesktop.login1"
+if [ -n "$STUB_SHUTDOWN" ]; then
+  echo "/org/freedesktop/login1: org.freedesktop.login1.Manager.PrepareForShutdownWithMetadata (true, {'type': <'reboot'>})"
+  echo "/org/freedesktop/login1: org.freedesktop.login1.Manager.PrepareForShutdown (true,)"
+  exec sleep 600
+fi
 echo "/org/freedesktop/login1: org.freedesktop.login1.Manager.PrepareForSleep (false,)"
 echo "/org/freedesktop/login1: org.freedesktop.login1.Manager.PrepareForSleep (true,)"
 exec sleep 600
@@ -108,12 +126,12 @@ for (const f of ["gdbus", "systemd-inhibit"]) fs.chmodSync(path.join(work, f), 0
 // Runs the monitor for `ms`, acking each sleep token after `ackAfterMs`
 // (never, if null); `acksFor(n)` says how many acks the nth token gets (one by
 // default). Returns the tokens and the inhibitor log.
-function runMonitor(ms, ackAfterMs, acksFor) {
+function runMonitor(ms, ackAfterMs, acksFor, extraEnv) {
   fs.writeFileSync(log, "")
   const cmd = Model.sleepMonitorCommand()
   return new Promise(resolve => {
     const child = spawn(cmd[0], cmd.slice(1), {
-      env: { ...process.env, PATH: `${work}:${process.env.PATH}` },
+      env: { ...process.env, PATH: `${work}:${process.env.PATH}`, ...(extraEnv || {}) },
       stdio: ["pipe", "pipe", "ignore"]
     })
     let out = ""
@@ -122,7 +140,7 @@ function runMonitor(ms, ackAfterMs, acksFor) {
       out += chunk
       const tokens = String(chunk).split("\n").map(t => t.trim())
       for (const t of tokens) {
-        if (t !== Model.sleepSignalToken()) continue
+        if (t !== Model.sleepSignalToken() && t !== Model.shutdownSignalToken()) continue
         const count = acksFor ? acksFor(seen) : 1
         seen++
         if (ackAfterMs === null) continue
@@ -200,6 +218,18 @@ const suspendChecks = (async () => {
       staleHolds.length >= 2 && staleHolds[0] < 2000
         && staleHolds[1] >= Model.sleepAckTimeoutS() * 1000 - 200,
       `${staleHolds.join(", ")}ms`)
+
+    // A shutdown announcement: its own token, the inhibitor held until the
+    // ack, and no resume reported afterwards (there is none).
+    const shutdown = await runMonitor(3000, 300, null, { STUB_SHUTDOWN: "1" })
+    check("a shutdown announcement produces the shutdown token",
+      shutdown.tokens[0] === Model.shutdownSignalToken(), JSON.stringify(shutdown.tokens))
+    check("a shutdown is not reported as a sleep or followed by a wake",
+      !shutdown.tokens.includes(Model.sleepSignalToken()) && !shutdown.tokens.includes(Model.wakeSignalToken()),
+      JSON.stringify(shutdown.tokens))
+    const shutdownHolds = held(shutdown.entries)
+    check("the shutdown inhibitor is released once the lock is acknowledged",
+      shutdownHolds.length >= 1 && shutdownHolds.every(ms => ms >= 250 && ms < 2500), `${shutdownHolds.join(", ")}ms`)
   } finally {
     fs.rmSync(work, { recursive: true, force: true })
   }

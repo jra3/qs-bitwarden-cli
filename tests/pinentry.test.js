@@ -22,14 +22,14 @@ const log = path.join(dir, "log")
 
 // One run of the script against the stand-in. `answer` is the stand-in's
 // next GETPIN answer (see the stand-in's header).
-function run(answer, opts = {}, program = fake) {
+function run(answer, opts = {}, program = fake, env = {}) {
   fs.writeFileSync(answers, answer + "\n")
   fs.writeFileSync(log, "")
   const argv = Model.pinentryCommand(program, Object.assign({ title: "Bitwarden", prompt: "Master password:" }, opts))
   const r = spawnSync(argv[0], argv.slice(1), {
     encoding: "utf8", timeout: 20000,
     // The description and error travel in the environment, as the panel runs it.
-    env: Object.assign({}, process.env, Model.pinentryEnvironment(opts), { FAKE_PINENTRY_ANSWERS: answers, FAKE_PINENTRY_LOG: log })
+    env: Object.assign({}, process.env, Model.pinentryEnvironment(opts), { FAKE_PINENTRY_ANSWERS: answers, FAKE_PINENTRY_LOG: log }, env)
   })
   return { code: r.status, out: r.stdout, err: r.stderr, log: fs.readFileSync(log, "utf8").split("\n").filter(Boolean) }
 }
@@ -83,6 +83,33 @@ eq("an empty answer is still empty, not short", r.code, exits.empty)
 check("short differs from the other codes",
   new Set(Object.values(exits)).size === Object.values(exits).length, JSON.stringify(exits))
 
+// --- a new PIN: typed twice in the window, digits only --------------------------------
+
+const newPin = { minLength: 6, repeat: Model.pinentryRepeatPrompt(), digits: true }
+r = run("pin:123456", newPin)
+eq("a new PIN that pinentry confirmed is printed", `${r.code}|${r.out}`, "0|123456")
+check("the window was asked for it twice, with a mismatch message, before GETPIN",
+  r.log.includes("SETREPEAT Repeat PIN:") && r.log.some(l => l.startsWith("SETREPEATERROR "))
+    && r.log.indexOf("SETREPEAT Repeat PIN:") < r.log.indexOf("GETPIN"), r.log.join("|"))
+r = run("pin:123456", newPin, fake, { FAKE_PINENTRY_NO_REPEAT: "1" })
+eq("a pinentry that took it once when asked twice is refused: nothing confirmed it", `${r.code}|${r.out}`, `${exits.norepeat}|`)
+r = run("pin:12a456", newPin)
+eq("a PIN with a letter is refused", `${r.code}|${r.out}`, `${exits.digits}|`)
+r = run("pin:%25%25%25%25%25%25", newPin)
+eq("an encoded character is not a digit either", `${r.code}|${r.out}`, `${exits.digits}|`)
+r = run("pin:12345", newPin)
+eq("the setup floor applies before the digits check", `${r.code}|${r.out}`, `${exits.short}|`)
+r = run("empty", newPin)
+eq("an empty answer is still empty", r.code, exits.empty)
+r = run("pin:hunter2", {})
+check("no repeat, no SETREPEAT, and letters pass", r.code === 0 && !r.log.some(l => l.startsWith("SETREPEAT")), r.log.join("|"))
+check("the new codes differ from every other",
+  new Set(Object.values(exits)).size === Object.values(exits).length
+    && exits.digits !== undefined && exits.norepeat !== undefined, JSON.stringify(exits))
+check("the repeat prompt is an argument, not script text",
+  !/Repeat PIN/.test(Model.pinentryCommand(fake, newPin)[2]) && Model.pinentryCommand(fake, newPin)[8] === "Repeat PIN:"
+    && Model.pinentryCommand(fake, newPin)[9] === "1" && Model.pinentryCommand(fake, {})[9] === "0", "")
+
 // --- what the pinentry is told ------------------------------------------------
 
 r = run("cancel", { title: "Bitwarden", description: "Unlock Bitwarden for 100%@x.com", prompt: "Master password:" })
@@ -115,6 +142,12 @@ check("the description names the account",
     && /master password/i.test(Model.pinentryDescription("reprompt", "you@example.com")), "")
 check("the description copes with no account",
   Model.pinentryDescription("unlock", "").length > 0, "")
+check("the login, setup and new-PIN purposes say what they are for",
+  /log in.*you@example\.com/i.test(Model.pinentryDescription("login", "you@example.com"))
+    && /confirm.*master password/i.test(Model.pinentryDescription("setupMaster", "you@example.com"))
+    && /PIN/.test(Model.pinentryDescription("newPin", "you@example.com"))
+    && Model.pinentryPrompt("newPin") === "New PIN:" && Model.pinentryPrompt("login") === "Master password:"
+    && Model.pinentryPrompt("setupMaster") === "Master password:", "")
 
 // --- the program ----------------------------------------------------------------
 
@@ -228,7 +261,7 @@ function driveHelper(requests) {
 }
 
 async function throughHelper() {
-  const request = (id, argv, extra) => JSON.stringify(Object.assign({ type: "exec", v: 1, id, argv, env: {}, inject: {} }, extra))
+  const request = (id, argv, extra) => JSON.stringify(Object.assign({ type: "exec", v: 2, id, argv, env: {}, inject: {} }, extra))
   fs.writeFileSync(answers, "pin:p%25w%0Ad+\ncancel\n")
   const ask = Model.pinentryCommand(fake, { title: "Bitwarden", prompt: "PIN:" })
   const show = ["bash", "-c", "printf '%s' \"$PW\""]

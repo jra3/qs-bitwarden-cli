@@ -140,11 +140,16 @@ check("the user is only made to press a key when the login failed",
   login.split("read -p").length === login.split("Not completed").length,
   `${login.split("read -p").length - 1} pauses vs ${login.split("Not completed").length - 1} failure branches`)
 check("a successful login closes the terminal on its own",
-  login.includes("Returning to the Bitwarden panel") && login.includes("sleep 1"),
+  login.includes("Returning to the Bitwarden panel") && /while kill -0 "\$__w"[^;]*-lt \d+/.test(login),
   "expected the success branch to close itself")
-// The key is a secret at rest: tmpfs, user-only, gone when the session ends.
+// The key is never at rest: it waits in the terminal shell's memory and
+// crosses to the panel over a named pipe, in the user-only runtime directory.
 check("the handoff lives in XDG_RUNTIME_DIR, not on disk",
   login.includes("XDG_RUNTIME_DIR"), login.slice(0, 120))
+check("the handoff is a pipe, never a file",
+  login.includes('mkfifo -m 600 -- "$f"') && !/--raw\s*>/.test(login), login)
+check("the writer gives up, and takes the pipe with it",
+  /sleep \d+; kill "\$__w" 2>\/dev\/null; rm -f -- "\$f"/.test(login), login)
 check("the handoff is created with a restrictive umask",
   login.includes("umask 077") && login.includes("chmod 700"), login.slice(0, 200))
 check("an incomplete login leaves nothing behind",
@@ -153,8 +158,8 @@ check("an incomplete login leaves nothing behind",
 const read = Model.sessionHandoffReadCommand(true)[2]
 check("the handoff is read once and removed with a byte limit",
   read.includes("head -c") && read.includes("rm -f"), read)
-check("an absent or empty handoff yields nothing",
-  read.includes("-s "), read)
+check("only a pipe is read, and the read is bounded in time as well as bytes",
+  read.includes('[ -p "$f" ]') && read.includes("timeout 5 head -c"), read)
 
 // The panel parses whatever the file holds through the same extractor it uses
 // for unlock output, so a stray newline or an `export BW_SESSION=` line is fine.

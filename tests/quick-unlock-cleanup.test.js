@@ -56,7 +56,8 @@ function vault() {
     "dropVaultState", "authAttemptInFlight", "unlockJobInFlight", "envelopeUnlockJobPending",
     "recheckStatusAfterUnlock", "onPinJobDropped", "quickUnlockSettingOff", "reconcileDisabledMethods", "openEnvelopeForFingerprint", "noteQuickUnlockEnabled", "dropEnvelopeState"])
   // Optional additions are exercised through their existing callers.
-  for (const name of ["cancelEnvelopeUnlockJobs", "onQuickUnlockPurgeDone", "queueQuickUnlockPurge", "reportQuickUnlockPurgeFailure"]) {
+  for (const name of ["cancelEnvelopeUnlockJobs", "onQuickUnlockPurgeDone", "queueQuickUnlockPurge", "reportQuickUnlockPurgeFailure",
+    "forgetJobSecrets"]) {
     if (functionBody(service, name)) bind(v, service, [name])
   }
   return v
@@ -194,9 +195,12 @@ for (const method of ["envelope PIN", "legacy PIN", "fingerprint", "FIDO2"]) {
     else {
       const f = { Model, vault: v, assertProc: {}, assertStdout: { text: "" },
         assertMode: "envelope", scanning: true, authorized: false, busyRetries: 0,
-        abandonedAtMs: 0, message: "", legacyStored: false, unlocked: value => v.unlocks.push(value) }
+        abandonedAtMs: 0, message: "", legacyStored: false, pinRef: "", unlocked: value => v.unlocks.push(value) }
       v.heldOutput = () => ref
       bind(f, read("FidoUnlock.qml"), ["onAssertExited"])
+      // The held key PIN, when there was one, goes with the outcome.
+      if (functionBody(read("FidoUnlock.qml"), "forgetPin")) bind(f, read("FidoUnlock.qml"), ["forgetPin"])
+      else f.forgetPin = () => {}
       f.onAssertExited(0)
     }
     eq(`${method}, ${active ? "live" : "abandoned"}: unlock count`, v.unlocks.length, active ? 1 : 0)

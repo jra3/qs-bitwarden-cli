@@ -8,9 +8,12 @@ const KEYRING_ACCOUNT = "session"
 const KEYRING_MASTER = "master_password"
 const KEYRING_FIDO = "fido_password"
 
-// `secret-tool store` reads stdin to EOF and Process.write() cannot close
-// stdin, so secrets reach it through this env var, piped in by a shell. Never
-// put a secret in argv: /proc/<pid>/cmdline is world-readable.
+// The names under which the master password and the PIN reach a script.
+// The envelope pipelines take them as records on stdin (see "Secrets on
+// stdin" below), read into plain shell variables; only the session store
+// (keyringStoreScript()) still takes QSBW_SECRET in its environment, piped
+// into `secret-tool store` by a shell since Process.write() cannot close
+// stdin. Never put a secret in argv: /proc/<pid>/cmdline is world-readable.
 const KEYRING_SECRET_ENV = "QSBW_SECRET"
 const KEYRING_PIN = "pin_blob"
 const PIN_ENV = "QSBW_PIN"
@@ -443,7 +446,7 @@ var MAX_FOLDERS_BYTES = 2 * 1024 * 1024     // 2 MB: folder list
 var MAX_ORGS_BYTES = 2 * 1024 * 1024        // 2 MB: organizations list
 var MAX_STATUS_BYTES = 64 * 1024            // 64 KB: status json
 var MAX_TOKEN_BYTES = 4096                  // 4 KB: session token / password / TOTP
-var MAX_HANDOFF_BYTES = 4096                // 4 KB: session handoff file
+var MAX_HANDOFF_BYTES = 4096                // 4 KB: session handoff pipe
 var MAX_ASSOC_BYTES = 1024 * 1024           // 1 MB: learned associations file
 var MAX_STDERR_BYTES = 8192                 // 8 KB: diagnostic stderr output
 var MAX_MISC_BYTES = 64 * 1024              // 64 KB: create/edit/delete responses
@@ -1061,12 +1064,19 @@ function apiKeyLoginCommand(serverUrl) {
 // -------------------------------------------------------------------------
 //
 // `bw login` in a terminal handles what the panel cannot (SSO, Duo, hardware
-// keys). The terminal writes its session key to a file under XDG_RUNTIME_DIR,
-// which the panel reads once and deletes. `--raw` keeps prompts on stderr.
+// keys). The terminal hands its session key to the panel through a FIFO under
+// XDG_RUNTIME_DIR: the key waits in the terminal shell's memory, with a
+// writer blocked on the pipe, until the panel reads it, and nothing is ever
+// written to the filesystem (the runtime directory is a tmpfs, but a tmpfs
+// can be swapped, and a file there outlived the login by up to ten minutes).
+// `--raw` keeps prompts on stderr.
 
-// No /tmp fallback if XDG_RUNTIME_DIR is unset: fail closed rather than write
+// No /tmp fallback if XDG_RUNTIME_DIR is unset: fail closed rather than put
 // a session key somewhere world-writable.
 var HANDOFF_BASENAME = "session-handoff"
+// How long the writer waits for the panel before giving up, matching the
+// window in which the panel reads (HANDOFF_WINDOW_MS).
+var HANDOFF_WRITER_WAIT_SEC = 600
 
 // `mode` is "login" or "unlock"; the panel already knows which, so no slow
 // `bw status` probe first. `slot` is the account's (a detached terminal gets
@@ -1075,22 +1085,35 @@ function terminalLoginCommand(mode, serverUrl, slot) {
   var verb = (mode === "unlock") ? "unlock" : "login"
   var configureServer = verb === "login" ? serverConfigPrefix(serverUrl) : ""
   var inner = "set -u; " + accountAppDataExport(slot) + appDataDirPrelude()
-    + "d=\"${XDG_RUNTIME_DIR:?no XDG_RUNTIME_DIR -- refusing to write a session key}/"
+    + "d=\"${XDG_RUNTIME_DIR:?no XDG_RUNTIME_DIR -- refusing to hand over a session key}/"
     + RUNTIME_SUBDIR + "\"; f=\"$d/" + HANDOFF_BASENAME + "\"; "
     // umask before mkdir so the dir is created 0700; a failed chmod means the
     // dir is not ours.
     + "umask 077; " + privateDirScript("d")
-    // Remove a stale entry before opening the output path, so a pre-created
-    // symlink is unlinked rather than followed by shell redirection.
+    // Remove a stale entry before making the pipe, so a pre-created symlink
+    // or file is unlinked rather than used; mkfifo refuses to replace one.
     + "rm -f -- \"$f\" || exit 1; "
     // Argv, as `bw config server` needs (see serverConfigPrefix()).
     + configureServer
-    + "if bw " + verb + " --raw > \"$f\" && [ -s \"$f\" ]; then "
+    // The key lands in this shell's memory, not in a file. `--raw` prints only
+    // the key on stdout; the prompts are on stderr and the terminal.
+    + "if __key=\"$(bw " + verb + " --raw)\" && [ -n \"$__key\" ] && mkfifo -m 600 -- \"$f\"; then "
+    // A writer blocked on the pipe until the panel opens it, bounded by a
+    // reaper that also removes the pipe, both deaf to the terminal closing.
+    // Neither keeps the terminal's stdout, so the terminal is not held open
+    // by them. printf is a builtin: the key is in no process's arguments.
+    + "( trap '' HUP; printf '%s' \"$__key\" > \"$f\" ) >/dev/null 2>&1 & __w=$!; "
+    + "( trap '' HUP; sleep " + HANDOFF_WRITER_WAIT_SEC + "; kill \"$__w\" 2>/dev/null; rm -f -- \"$f\" ) >/dev/null 2>&1 & "
+    + "__key=''; "
     // Bring the panel back itself rather than making the user find it again.
     // Only the method name crosses this boundary; the key never does.
     + "omarchy-shell io.github.elevate08.qs-bitwarden-cli open >/dev/null 2>&1 || true; "
-    + "echo; echo 'Done. Returning to the Bitwarden panel...'; sleep 1; "
-    + "else rm -f \"$f\"; echo; echo 'Not completed -- nothing was handed to the panel.'; "
+    + "echo; echo 'Done. Returning to the Bitwarden panel...'; "
+    // Stay up a few seconds while the panel takes the key, so the terminal
+    // closes after the hand-over rather than mid-way; the writer waits on
+    // without it if the panel is slower.
+    + "__n=0; while kill -0 \"$__w\" 2>/dev/null && [ \"$__n\" -lt 20 ]; do sleep 0.25; __n=$((__n + 1)); done; "
+    + "else __key=''; rm -f -- \"$f\"; echo; echo 'Not completed -- nothing was handed to the panel.'; "
     + "read -p 'Press enter to close...'; fi"
   var script = "omarchy launch terminal -e bash -c " + shellQuote(inner)
     + " || alacritty -e bash -c " + shellQuote(inner)
@@ -1123,20 +1146,24 @@ function handoffWindowOpen(startedAt, now) {
   return windowOpen(startedAt, now, HANDOFF_WINDOW_MS)
 }
 
-// Reads and deletes the handoff file. The key is only read while `expecting`
-// (shortly after we launched a terminal login), so no other process can hand
-// the panel a session key at a time of its choosing; the file is deleted
-// either way. A missing runtime dir means nothing was handed over.
+// Reads from the handoff pipe and removes it. The key is only read while
+// `expecting` (shortly after we launched a terminal login), so no other
+// process can hand the panel a session key at a time of its choosing; the
+// pipe is removed either way, and so is anything that is not a pipe at that
+// path (a file an older version left). Opening a pipe nobody is writing
+// would block, so the read is bounded. A missing runtime dir means nothing
+// was handed over.
 function sessionHandoffReadCommand(expecting) {
   var script = "d=\"${XDG_RUNTIME_DIR:-}\"; [ -n \"$d\" ] || exit 0; "
     + "d=\"$d/" + RUNTIME_SUBDIR + "\"; "
     + "[ -d \"$d\" ] && [ ! -L \"$d\" ] || exit 0; "
     + "f=\"$d/" + HANDOFF_BASENAME + "\"; "
-    + "[ -s \"$f\" ] && [ -f \"$f\" ] && [ ! -L \"$f\" ] || exit 0; "
+    + "[ -e \"$f\" ] || [ -L \"$f\" ] || exit 0; "
+    + "[ -p \"$f\" ] && [ ! -L \"$f\" ] || { rm -f -- \"$f\"; exit 0; }; "
   if (expecting) {
-    script += "head -c " + MAX_HANDOFF_BYTES + " \"$f\"; "
+    script += "timeout 5 head -c " + MAX_HANDOFF_BYTES + " -- \"$f\"; "
   }
-  script += "rm -f \"$f\""
+  script += "rm -f -- \"$f\""
   return ["bash", "-c", script]
 }
 
@@ -1148,14 +1175,29 @@ function sessionHandoffReadCommand(expecting) {
 // does for 1Password.
 
 // Screen lock is polled: Omarchy's lock screen (ext-session-lock) never tells
-// logind, so only the shell's lock plugin knows, via IPC. Only "true" means
-// locked; a missing plugin must never read as locked.
+// logind. The shell's lock plugin knows about the locks it started, via IPC;
+// the compositor knows about every ext-session-lock, including a `hyprlock`
+// run by hand that never went through the lock plugin, and Omarchy's
+// `omarchy-hyprland-session-locked` reads that off `hyprctl` (exit 0 locked,
+// 1 unlocked, 2 undetermined). Either saying locked is locked. Only "true"
+// means locked; a missing plugin or detector must never read as locked, and
+// "undetermined" is a third answer: not a lock, but not a clear screen either.
 function screenLockStateCommand() {
-  return ["bash", "-c", "omarchy-shell lock isLocked 2>/dev/null | head -c 16"]
+  return ["bash", "-c", "__s=\"$(omarchy-shell lock isLocked 2>/dev/null | head -c 16 | tr -d '[:space:]')\"; "
+    + "if [ \"$__s\" = true ]; then echo true; exit 0; fi; "
+    + "omarchy-hyprland-session-locked >/dev/null 2>&1; "
+    + "case $? in 0) echo true ;; 2) echo undetermined ;; *) echo false ;; esac"]
 }
 
 function screenIsLocked(raw) {
   return String(raw || "").trim() === "true"
+}
+
+// The compositor could not be asked (no answer from `hyprctl`, or no monitor
+// with a workspace yet). Nothing to lock the vault over, but not a screen an
+// SSH prompt should be raised on either.
+function screenLockUndetermined(raw) {
+  return String(raw || "").trim() === "undetermined"
 }
 
 // Polled only while the setting is on and the vault unlocked (~50 ms per call).
@@ -1171,7 +1213,13 @@ function screenLockPollMs() {
 // only on exit, so each loop iteration takes a fresh one. The monitor is
 // killed by pid once sed matches; waiting for a broken pipe would hold the
 // inhibitor until the next signal, which is the resume.
+// Shutdown and reboot are the same shape: PrepareForShutdown(true), under a
+// shutdown delay inhibitor. Nothing else locks then: the shell is killed
+// rather than unloaded, so Component.onDestruction never runs, and a
+// remembered session's keyring copy dies with the secret service while the
+// key it holds stays valid in bw's data until `bw lock`.
 var SLEEP_SIGNAL_TOKEN = "sleep"
+var SHUTDOWN_SIGNAL_TOKEN = "shutdown"
 var WAKE_SIGNAL_TOKEN = "wake"
 // What the panel writes to the monitor's stdin once `bw lock` (and the
 // keyring clear) has finished.
@@ -1182,6 +1230,7 @@ var SLEEP_ACK_TOKEN = "ack"
 var SLEEP_ACK_TIMEOUT_S = 4
 
 function sleepSignalToken() { return SLEEP_SIGNAL_TOKEN }
+function shutdownSignalToken() { return SHUTDOWN_SIGNAL_TOKEN }
 function wakeSignalToken() { return WAKE_SIGNAL_TOKEN }
 function sleepAckLine() { return SLEEP_ACK_TOKEN + "\n" }
 function sleepAckTimeoutS() { return SLEEP_ACK_TIMEOUT_S }
@@ -1191,8 +1240,10 @@ function sleepMonitorCommand() {
     + " --object-path /org/freedesktop/login1 2>/dev/null"
 
   // -u so the match leaves sed the moment it is read, rather than sitting in a
-  // block buffer until after the machine has already suspended.
-  var match = "sed -une '/PrepareForSleep (true,/{s/.*/x/p;q}'"
+  // block buffer until after the machine has already suspended. Each match
+  // prints its token, so the panel learns which one it was.
+  var match = "sed -une '/PrepareForSleep (true,/{s/.*/" + SLEEP_SIGNAL_TOKEN + "/p;q}; "
+    + "/PrepareForShutdown (true,/{s/.*/" + SHUTDOWN_SIGNAL_TOKEN + "/p;q}'"
 
   // stdin is the ack pipe (fd 4 below). Acks left from an earlier cycle are
   // drained before the token goes out, so only this cycle's ack can end the
@@ -1203,8 +1254,10 @@ function sleepMonitorCommand() {
     // gdbus ended without a sleep: not a resume, so no wake token.
     + "[ -n \"$m\" ] || exit 1; "
     + "while read -r -t 0.05 _; do :; done; "
-    + "echo " + shellQuote(SLEEP_SIGNAL_TOKEN) + "; "
-    + "read -r -t " + SLEEP_ACK_TIMEOUT_S + " _; exit 0"
+    + "printf '%s\\n' \"$m\"; "
+    + "read -r -t " + SLEEP_ACK_TIMEOUT_S + " _; "
+    // Only a sleep has a resume to report.
+    + "[ \"$m\" = " + SLEEP_SIGNAL_TOKEN + " ]"
 
   // Never exits on its own; failures wait before retrying so it cannot spin.
   // Quickshell kills only its direct child on reload, so a watcher on stdin
@@ -1218,9 +1271,9 @@ function sleepMonitorCommand() {
     + shellQuote(SLEEP_ACK_TOKEN) + " >&4; done; kill -KILL -- -$$) <&0 & "
     + "while :; do "
     + "command -v gdbus >/dev/null 2>&1 || { sleep 300; continue; }; "
-    + "if systemd-inhibit --what=sleep --mode=delay"
+    + "if systemd-inhibit --what=sleep:shutdown --mode=delay"
     + " --who=" + shellQuote("Bitwarden")
-    + " --why=" + shellQuote("Locking the vault before sleep")
+    + " --why=" + shellQuote("Locking the vault before sleep or shutdown")
     + " bash -c " + shellQuote(inner) + " <&4; then "
     // Resume. Reported once the inhibitor is gone, since nothing waits on it.
     + "echo " + shellQuote(WAKE_SIGNAL_TOKEN) + "; "
@@ -1643,20 +1696,73 @@ function deleteItemCommand(itemId, typeCode) {
 // Remembered session
 // -------------------------------------------------------------------------
 //
-// The session token must not survive a reboot. It is stored in libsecret's
-// in-memory `session` collection where available (falling back to the
-// default), and prefixed with the kernel boot id, so a token from another
-// boot is refused and cleared. Every failure reads as "no token".
-const KEYRING_SESSION_COLLECTION = "session"
+// The session token must not survive a reboot, and must not reach disk at
+// all. It is stored only in libsecret's in-memory `session` collection, and
+// prefixed with the kernel boot id, so a token from another boot is refused
+// and cleared. It used to fall back to the default collection when the
+// session one refused the write; on Omarchy that collection is a plaintext
+// file under ~/.local/share/keyrings, so a secret service without a session
+// collection put the raw key on disk, where the boot-id check (the panel's
+// alone; `bw` accepts the key until `bw lock`) protects nothing. Now the
+// store fails instead, and the panel says the session was not remembered.
+// A lookup failure still reads as "no token".
+// By its bus path: secret-tool 0.21.8 takes a path or the `default` alias
+// only, and refuses `--collection=session` as a usage error.
+const KEYRING_SESSION_COLLECTION = "/org/freedesktop/secrets/collection/session"
+// Where the session collection's items live on the bus. The store asks for
+// that collection, but what libsecret did is checked here: an item anywhere
+// else is removed again.
+const KEYRING_SESSION_ITEM_PREFIX = KEYRING_SESSION_COLLECTION + "/"
 const BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
 
+// keyringStoreCommand()'s exit codes past 0 and secret-tool's own 1.
+// The session collection refused the write (none, or the service is down).
+const KEYRING_STORE_UNAVAILABLE = 2
+// The write was accepted but the item is not in the session collection: it
+// has been removed again.
+const KEYRING_STORE_MISPLACED = 3
+// The write was accepted but the check could not see the item (a search
+// that failed or found nothing); any item is removed, to be safe.
+const KEYRING_STORE_UNVERIFIED = 4
+
+function keyringStoreUnavailableCode() { return KEYRING_STORE_UNAVAILABLE }
+function keyringStoreMisplacedCode() { return KEYRING_STORE_MISPLACED }
+function keyringStoreUnverifiedCode() { return KEYRING_STORE_UNVERIFIED }
+
+// Lists where the entry's items are: one item path per line, from the
+// secret service's SearchItems, which answers with paths only (no secret).
+// `secret-tool search` cannot be used: 0.21.8 prints an item as `[/7]`,
+// without its collection. Fails if the search did.
+function keyringItemPathsScript(account, resultVar) {
+  return resultVar + "=$(busctl --user call org.freedesktop.secrets /org/freedesktop/secrets"
+    + " org.freedesktop.Secret.Service SearchItems 'a{ss}' 2 service " + shellQuote(KEYRING_SERVICE)
+    + " account " + shellQuote(account)
+    + " 2>/dev/null | head -c 65536 | grep -o '\"/[^\"]*\"' | tr -d '\"'; "
+    + "__keyring_pipe=(\"${PIPESTATUS[@]}\"); "
+    + "printf '\\n:%s' \"${__keyring_pipe[0]}\"); "
+}
+
 function keyringStoreCommand(slot) {
-  var attrs = keyringAttributes(keyringEntryName(KEYRING_ACCOUNT, slot))
+  var account = keyringEntryName(KEYRING_ACCOUNT, slot)
+  var attrs = keyringAttributes(account)
   // Only the boot id is read in the script; the token comes from the env.
-  var script = "store() { printf '%s %s' \"$(cat " + shellQuote(BOOT_ID_PATH) + ")\" \"$"
-    + KEYRING_SECRET_ENV + "\" | secret-tool store \"$@\" --label="
-    + shellQuote("Bitwarden Vault Session") + attrs + "; }; "
-    + "store --collection=" + shellQuote(KEYRING_SESSION_COLLECTION) + " 2>/dev/null || store"
+  var script = "printf '%s %s' \"$(cat " + shellQuote(BOOT_ID_PATH) + ")\" \"$"
+    + KEYRING_SECRET_ENV + "\" | secret-tool store --collection="
+    + shellQuote(KEYRING_SESSION_COLLECTION) + " --label="
+    + shellQuote("Bitwarden Vault Session") + attrs + " >/dev/null 2>&1 "
+    + "|| exit " + KEYRING_STORE_UNAVAILABLE + "; "
+    + keyringItemPathsScript(account, "__keyring_items")
+    + "__keyring_search_rc=${__keyring_items##*:}; "
+    // Through $(...), which drops the trailing newline a non-empty list has.
+    + "__keyring_paths=$(printf '%s' \"${__keyring_items%:*}\"); "
+    + "__keyring_rc=0; "
+    + "if [ \"$__keyring_search_rc\" -ne 0 ] || [ -z \"$__keyring_paths\" ]; then __keyring_rc="
+    + KEYRING_STORE_UNVERIFIED + "; "
+    // Every item must be in the session collection, not only one of them.
+    + "elif printf '%s\\n' \"$__keyring_paths\" | grep -qv '^" + KEYRING_SESSION_ITEM_PREFIX
+    + "'; then __keyring_rc=" + KEYRING_STORE_MISPLACED + "; fi; "
+    + "if [ \"$__keyring_rc\" -ne 0 ]; then secret-tool clear" + attrs + " >/dev/null 2>&1; fi; "
+    + "exit \"$__keyring_rc\""
   return ["bash", "-c", script]
 }
 
@@ -1673,16 +1779,27 @@ function keyringLookupCommand(slot) {
   return ["bash", "-c", cappedScript(script)]
 }
 
-// Exits 0 only once no session entry is left: `secret-tool clear` exits 1
-// when nothing matched and skips locked matches, so its own status says
-// nothing either way. The check searches without unlocking (no keyring
+// Exits 0 only once no session entry is seen to be left: `secret-tool clear`
+// exits 1 when nothing matched and skips locked matches, so its own status
+// says nothing either way. The check searches without unlocking (no keyring
 // prompt) and counts the output rather than capturing it, since it contains
-// the secret.
+// the secret. The search's own status is kept: with the secret service
+// down, a search prints nothing and the count alone read as "gone", so an
+// entry that came back with the service was reported cleared.
+const KEYRING_CLEAR_LEFT = 1
+const KEYRING_CLEAR_UNKNOWN = 2
+
+function keyringClearUnknownCode() { return KEYRING_CLEAR_UNKNOWN }
+
 function keyringClearCommand(slot) {
-  var attrs = keyringAttributes(keyringEntryName(KEYRING_ACCOUNT, slot))
+  var account = keyringEntryName(KEYRING_ACCOUNT, slot)
+  var attrs = keyringAttributes(account)
   var script = "secret-tool clear" + attrs + " >/dev/null 2>&1; "
-    + "__left=$(secret-tool search" + attrs + " 2>/dev/null | wc -c | tr -d '[:space:]'); "
-    + "[ \"${__left:-0}\" = 0 ]"
+    + keyringSearchStateScript(account, "__keyring_after")
+    + "__keyring_count=${__keyring_after%%:*}; "
+    + "__keyring_search_rc=${__keyring_after##*:}; "
+    + "if [ \"$__keyring_search_rc\" -ne 0 ]; then exit " + KEYRING_CLEAR_UNKNOWN + "; fi; "
+    + "[ \"${__keyring_count:-0}\" = 0 ] || exit " + KEYRING_CLEAR_LEFT
   return ["bash", "-c", script]
 }
 
@@ -1766,11 +1883,61 @@ function isPinWeak(pin) {
   return pinWeakWarning(pin) !== ""
 }
 
-// Decrypts the legacy PIN blob. Non-zero exit: wrong PIN or no blob.
+// -------------------------------------------------------------------------
+// Secrets on stdin
+// -------------------------------------------------------------------------
+//
+// A script that needs the master password, a PIN or a FIDO2 hmac-secret gets
+// it on stdin, never in its environment: /proc/<pid>/environ is readable by
+// every process running as the same user, for the life of the process and of
+// every child that inherits it (secret-tool, systemd-creds, jq, head, cmp,
+// argon2...). The vault helper (or, falling back, the panel) writes
+// `NAME=value` records ended by NUL, then an empty record; SECRETS_PREAMBLE
+// reads them into plain shell variables -- never exported -- once per
+// process, before anything else runs, and stops at the empty record so the
+// rest of stdin is the script's. A step nested in another script runs as a
+// subshell (nestedScript()), which inherits the variables with no
+// environment at all. The one process that then needs a secret, the unlock
+// tool, gets it on a descriptor of its own: `--secrets-fd 3 3< <(__feed ...)`,
+// a pipe only it and the builtin `printf` behind it ever hold. A value never
+// holds NUL, so `read -d ''` sees it whole, newlines included.
+var SECRET_RECORD_END = "\u0000"
+var SECRETS_PREAMBLE = "if [ -z \"${__secrets_read:-}\" ]; then __secrets_read=1; "
+  + "while IFS= read -r -d '' __rec && [ -n \"$__rec\" ]; do __n=\"${__rec%%=*}\"; "
+  + "case \"$__n\" in ''|[0-9]*|*[!A-Za-z0-9_]*) continue ;; esac; "
+  + "printf -v \"$__n\" '%s' \"${__rec#*=}\"; done; unset __rec __n; fi; "
+  // name value [name value]... -> records for the unlock tool's descriptor.
+  + "__feed() { while [ \"$#\" -ge 2 ]; do printf '%s=%s\\0' \"$1\" \"$2\"; shift 2; done; }; "
+
+function secretsPreamble() { return SECRETS_PREAMBLE }
+
+// The stdin block the panel writes itself when a run falls back to the
+// shell (the helper writes the same from `secrets`/`heldSecrets`).
+function secretBlock(values) {
+  var out = ""
+  for (var name in values) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) continue
+    var value = values[name]
+    out += name + "=" + String(value === undefined || value === null ? "" : value) + SECRET_RECORD_END
+  }
+  return out + SECRET_RECORD_END
+}
+
+// ` --secrets-fd 3 3< <(__feed ...)`: the unlock tool's secrets, from shell
+// expressions. Goes after the tool's other arguments.
+function toolSecrets(pairs) {
+  var feed = ""
+  for (var i = 0; i < pairs.length; i++) feed += " " + pairs[i][0] + " " + pairs[i][1]
+  return " --secrets-fd 3 3< <(__feed" + feed + ")"
+}
+
+// Decrypts the legacy PIN blob, the PIN read from stdin (PIN_ENV record) and
+// handed to openssl on a descriptor. Non-zero exit: wrong PIN or no blob.
 function pinUnlockCommand(slot) {
-  var script = "secret-tool lookup" + keyringAttributes(keyringEntryName(KEYRING_PIN, slot)) + " 2>/dev/null | head -c 8192"
+  var script = SECRETS_PREAMBLE
+    + "secret-tool lookup" + keyringAttributes(keyringEntryName(KEYRING_PIN, slot)) + " 2>/dev/null | head -c 8192"
     + " | openssl enc -d -aes-256-cbc -pbkdf2 -iter " + PIN_ITERATIONS
-    + " -md sha256 -pass env:" + PIN_ENV + " -base64 -A | head -c " + MAX_TOKEN_BYTES
+    + " -md sha256 -pass fd:3 -base64 -A 3< <(printf '%s' \"$" + PIN_ENV + "\") | head -c " + MAX_TOKEN_BYTES
   return ["bash", "-c", cappedScript(script)]
 }
 
@@ -1806,21 +1973,31 @@ var PINENTRY_TIMEOUT_S = 120
 var PINENTRY_GIVE_UP_S = PINENTRY_TIMEOUT_S + 30
 // Exit codes of the script (and 127, 126 and 128+ for a program that is
 // missing, a helper that does not know the capture, or a kill).
-var PINENTRY_EXIT = { cancelled: 1, empty: 3, failed: 4, short: 5, missing: 127 }
+// `digits` and `norepeat` are a new PIN's: an answer that is not all digits,
+// and a pinentry that took the PIN once when it was asked to take it twice
+// (SETREPEAT), so nothing confirmed it.
+var PINENTRY_EXIT = { cancelled: 1, empty: 3, failed: 4, short: 5, digits: 6, norepeat: 7, missing: 127 }
 
 function pinentryExitCodes() {
   return { cancelled: PINENTRY_EXIT.cancelled, empty: PINENTRY_EXIT.empty,
-           failed: PINENTRY_EXIT.failed, short: PINENTRY_EXIT.short, missing: PINENTRY_EXIT.missing }
+           failed: PINENTRY_EXIT.failed, short: PINENTRY_EXIT.short, digits: PINENTRY_EXIT.digits,
+           norepeat: PINENTRY_EXIT.norepeat, missing: PINENTRY_EXIT.missing }
 }
 
 // pinentry's own "operation cancelled" is GPG_ERR_CANCELED (99) from source
 // 5, 83886179; any code whose low 16 bits are 99 is read as a cancel. Its
 // timeout, GPG_ERR_TIMEOUT (62), is one too: nobody answered.
+//
+// A repeat prompt ($5) asks pinentry for the answer twice in its own window
+// (SETREPEAT), so a new PIN is confirmed without the panel seeing either
+// copy. A pinentry that confirmed says `S PIN_REPEATED` before its OK; one
+// that cannot (pinentry-tty, an old curses) answers OK after one entry, and
+// that is refused rather than taken as confirmed.
 var PINENTRY_SCRIPT = [
   PINENTRY_RESOLVE,
   // The description and error can name the account, so they come in the
   // environment, not argv, and are gone before pinentry starts.
-  "__title=\"$2\"; __prompt=\"$3\"; __min=\"${4:-0}\"",
+  "__title=\"$2\"; __prompt=\"$3\"; __min=\"${4:-0}\"; __repeat=\"$5\"; __digits=\"${6:-0}\"",
   "__desc=\"$" + PINENTRY_DESC_ENV + "\"; __err=\"$" + PINENTRY_ERR_ENV + "\"",
   "unset " + PINENTRY_DESC_ENV + " " + PINENTRY_ERR_ENV,
   "command -v -- \"$__prog\" >/dev/null 2>&1 || exit " + PINENTRY_EXIT.missing,
@@ -1840,18 +2017,23 @@ var PINENTRY_SCRIPT = [
   "__enc \"$__desc\"; __ask \"SETDESC $__e\"",
   "__enc \"$__prompt\"; __ask \"SETPROMPT $__e\"",
   "if [ -n \"$__err\" ]; then __enc \"$__err\"; __ask \"SETERROR $__e\"; fi",
+  "if [ -n \"$__repeat\" ]; then __enc \"$__repeat\"; __ask \"SETREPEAT $__e\"; __ask \"SETREPEATERROR PINs do not match\"; fi",
   "__ask \"SETTIMEOUT " + PINENTRY_TIMEOUT_S + "\"",
   "printf 'GETPIN\\n' >&\"${PE[1]}\" || exit " + PINENTRY_EXIT.failed,
-  "__d=''",
+  "__d=''; __repeated=0",
   "while IFS= read -r -t " + PINENTRY_GIVE_UP_S + " -u \"${PE[0]}\" __l; do",
   "  case \"$__l\" in",
   "    'D '*) __d=\"$__d${__l:2}\" ;;",
+  "    'S PIN_REPEATED'|'S PIN_REPEATED '*) __repeated=1 ;;",
   "    OK|OK\\ *)",
   "      printf 'BYE\\n' >&\"${PE[1]}\"",
   "      [ -n \"$__d\" ] || exit " + PINENTRY_EXIT.empty,
   // The length of what was typed: each %XX stands for one character.
   "      __t=\"${__d//[^%]/}\"; __n=$(( ${#__d} - 2 * ${#__t} ))",
   "      if [[ \"$__min\" =~ ^[0-9]+$ ]] && (( __n < __min )); then exit " + PINENTRY_EXIT.short + "; fi",
+  // Digits are never encoded, so anything else in the data is not a digit.
+  "      if [ \"$__digits\" = 1 ] && [[ ! \"$__d\" =~ ^[0-9]+$ ]]; then exit " + PINENTRY_EXIT.digits + "; fi",
+  "      if [ -n \"$__repeat\" ] && [ \"$__repeated\" != 1 ]; then exit " + PINENTRY_EXIT.norepeat + "; fi",
   "      printf '%s' \"$__d\"; exit 0 ;;",
   "    ERR|ERR\\ *)",
   "      __c=\"${__l#ERR }\"; __c=\"${__c%% *}\"",
@@ -1866,6 +2048,12 @@ var PINENTRY_SCRIPT = [
 // opens pinentry again, and the field is used only when picked.
 function pinentryFailedNotice() {
   return "Pinentry stopped before answering. Try again, or type it here instead."
+}
+
+// A new PIN was asked for twice (SETREPEAT) and this pinentry took it once:
+// nothing confirmed it, so it was not kept. Not remembered either.
+function pinentryNoRepeatNotice() {
+  return "This pinentry cannot ask for the PIN twice to confirm it. Type it here instead."
 }
 
 // `bw unlock` refusing the password itself, as opposed to any other failure
@@ -1906,11 +2094,15 @@ function pinentryProgram(configured) {
 
 // `opts`: { title, description, prompt, error } as plain text, and
 // `minLength`: an answer of fewer characters exits short (nothing is held).
+// `repeat` is the prompt of a second field that must match (a new PIN), and
+// `digits` refuses an answer that is not all digits; both exit with their
+// own code and print nothing.
 function pinentryCommand(program, opts) {
   var o = opts || {}
   return ["bash", "-c", PINENTRY_SCRIPT, "_", pinentryProgram(program),
     pinentryText(o.title), pinentryText(o.prompt),
-    String(Math.max(0, Math.floor(Number(o.minLength) || 0)))]
+    String(Math.max(0, Math.floor(Number(o.minLength) || 0))),
+    pinentryText(o.repeat), o.digits ? "1" : "0"]
 }
 
 // The environment pinentryCommand() reads its description and error from
@@ -1952,17 +2144,46 @@ function typedSecretEntry(o) {
   return "wait"
 }
 
-// purpose: "unlock" (master password), "pin", "reprompt".
+// purpose: "unlock" (master password), "pin", "reprompt", "login" (the
+// email login's master password), "setupMaster" (the password a quick-unlock
+// setup form confirms), "newPin" (the PIN that form chooses) and "fidoPin"
+// (the FIDO2 key's own PIN, which its registration asks for).
 function pinentryDescription(purpose, email) {
   var who = String(email || "").trim()
   var suffix = who ? " for " + who : ""
   if (purpose === "pin") return "Enter the PIN that unlocks Bitwarden" + suffix
   if (purpose === "reprompt") return "Confirm your Bitwarden master password" + suffix
+  if (purpose === "login") return "Log in to Bitwarden" + (who ? " as " + who : "")
+  if (purpose === "setupMaster") return "Confirm your Bitwarden master password to add an unlock method" + suffix
+  if (purpose === "newPin") return "Choose the PIN that will unlock Bitwarden" + suffix
+  if (purpose === "fidoPin") return "Enter your FIDO2 key's PIN to unlock Bitwarden" + suffix + ", then touch the key"
   return "Unlock Bitwarden" + suffix
 }
 
 function pinentryPrompt(purpose) {
-  return purpose === "pin" ? "PIN:" : "Master password:"
+  if (purpose === "pin") return "PIN:"
+  if (purpose === "newPin") return "New PIN:"
+  if (purpose === "fidoPin") return "Key PIN:"
+  return "Master password:"
+}
+
+// The second field of a new PIN (SETREPEAT).
+function pinentryRepeatPrompt() { return "Repeat PIN:" }
+
+// CTAP's floor for a client PIN. Shorter is asked for again rather than
+// sent, since every refusal spends one of the key's eight tries.
+var FIDO_PIN_MIN_LENGTH = 4
+function fidoPinMinLength() { return FIDO_PIN_MIN_LENGTH }
+
+// Why quick unlock is unavailable with `storeMasterPassword: false`.
+function storeMasterPasswordOffReason() {
+  return "storeMasterPassword is false in shell.json: the master password is never kept in the keyring, "
+    + "so there is nothing for a PIN, fingerprint or key to open."
+}
+
+// An enable form's warning, asking for the second press.
+function downgradeConfirmText(warning) {
+  return "󰀪  " + warning + " Press Enable again to add it anyway."
 }
 
 function keyringClearPinCommand(slot) {
@@ -1985,8 +2206,10 @@ function keyringHasPinCommand(slot) {
 //     -> systemd-creds --user encrypt -> verify -> secret-tool store
 //
 // with `argon2` deriving keys from the password or PIN. QML only ever gets a
-// secret-free summary, or the password on unlock. Secrets travel only in env
-// vars via `printf` (a builtin); salts, parameters and ids may be in argv.
+// secret-free summary, or the password on unlock. Secrets arrive on stdin
+// (SECRETS_PREAMBLE), live in unexported shell variables, and reach argon2
+// and the tool through pipes from `printf` (a builtin); salts, parameters
+// and ids may be in argv. No child's environment ever holds one.
 // Writes commit last: the new envelope is re-opened and checked before
 // `secret-tool store`, so any failure leaves the old one intact.
 var KEYRING_ENVELOPE = "unlock_envelope"
@@ -1996,6 +2219,12 @@ var ENVELOPE_CREDENTIAL_NAME = "qs-bitwarden-unlock"
 var NEW_SECRET_ENV = "QSBW_NEW_SECRET"
 var FIDO_HMAC_ENV = "QSBW_FIDO_HMAC"
 var FIDO_SALT_ENV = "QSBW_FIDO_SALT"
+// The key's own PIN, for a registration made with +pin or +verification.
+var FIDO_PIN_ENV = "QSBW_FIDO_PIN"
+// The tool's record names (unlock-key/src/main.rs).
+var TOOL_PASSWORD = "QSBW_UNLOCK_PASSWORD"
+var TOOL_KEY = "QSBW_UNLOCK_KEY"
+var TOOL_NEW_KEY = "QSBW_UNLOCK_NEW_KEY"
 // Argon2id for new wraps (256 MiB, 4 passes: about 0.46 s per derivation on
 // a 16-thread laptop; see PIN_GUESSES_PER_SECOND for what that means for a
 // PIN). Existing wraps use their recorded parameters; the tool refuses any
@@ -2016,6 +2245,7 @@ var ENVELOPE_EXIT = {
 }
 
 function envelopeNewSecretEnvVar() { return NEW_SECRET_ENV }
+function fidoPinEnvVar() { return FIDO_PIN_ENV }
 function envelopeExitCodes() { return ENVELOPE_EXIT }
 
 var ENVELOPE_BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/
@@ -2023,8 +2253,11 @@ var ENVELOPE_BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/
 // Exits as a usage error, for arguments that should never reach a builder.
 function envelopeRefused() { return ["bash", "-c", "exit 2"] }
 
-// A ["bash", "-c", script] command as a step inside another script.
-function nestedScript(cmd) { return "bash -c " + shellQuote(cmd[2]) }
+// A ["bash", "-c", script] command as a step inside another script: a
+// subshell, so it sees the outer script's variables (the secrets it read
+// from stdin) without an environment, and its `exit` ends only itself. Its
+// own SECRETS_PREAMBLE finds __secrets_read set and reads nothing.
+function nestedScript(cmd) { return "( " + cmd[2] + "\n)" }
 
 function envelopeArgsOk(tool, account) {
   return typeof tool === "string" && tool.charAt(0) === "/"
@@ -2052,7 +2285,7 @@ function envelopeAccountEnv(account) {
 // Functions every envelope script starts with.
 // `slot` picks the account's envelope entry; see keyringEntryName().
 function envelopePrelude(tool, slot) {
-  return "__tool=" + shellQuote(tool) + "; "
+  return SECRETS_PREAMBLE + "__tool=" + shellQuote(tool) + "; "
     + "__name=" + shellQuote(ENVELOPE_CREDENTIAL_NAME) + "; "
     + "__lookup() { secret-tool lookup" + keyringAttributes(keyringEntryName(KEYRING_ENVELOPE, slot))
     + " 2>/dev/null | head -c " + MAX_ENVELOPE_SEALED_BYTES + "; }; "
@@ -2088,9 +2321,9 @@ function envelopePrelude(tool, slot) {
     + ">/dev/null || exit " + ENVELOPE_EXIT.verify + "; }; "
     // ...and yield exactly the password through the way just written. cmp on
     // streams keeps a trailing newline significant; the way's key ($__vk)
-    // goes in the tool's env, never argv.
+    // goes to the tool on its descriptor, never argv or env.
     + "__verify_opens() { cmp -s <(printf '%s' \"$1\") "
-    + "<(__unseal \"$__new\" | QSBW_UNLOCK_KEY=\"$__vk\" \"$__tool\" open \"${@:2}\") "
+    + "<(__unseal \"$__new\" | \"$__tool\" open \"${@:2}\"" + toolSecrets([[TOOL_KEY, "\"$__vk\""]]) + ") "
     + "|| exit " + ENVELOPE_EXIT.verify + "; }; "
     + "__store() { printf '%s' \"$__new\" | secret-tool store --label=" + shellQuote(ENVELOPE_LABEL)
     + keyringAttributes(keyringEntryName(KEYRING_ENVELOPE, slot)) + " || exit " + ENVELOPE_EXIT.store + "; }; "
@@ -2104,6 +2337,17 @@ function envelopeArgon2Args(saltVar) {
 function envelopeNewKey(secretExpr, saltVar) {
   return "__kdf " + secretExpr + " \"$" + saltVar + "\" " + ENVELOPE_ARGON2.t + " "
     + ENVELOPE_ARGON2.m + " " + ENVELOPE_ARGON2.p
+}
+
+// Removes the account's envelope entry: `storeMasterPassword` is off, or no
+// method is on to use it. Nothing else of the account's is touched.
+// Removes the envelope of every account in `slots`. Exit 0 when none is left
+// (none there counts), 1 when a clear failed.
+function unlockEnvelopeClearCommand(slots) {
+  var script = "rc=0; "
+  var list = uniqueAccountSlots(slots)
+  for (var i = 0; i < list.length; i++) script += keyringClearCheckedScript(keyringEntryName(KEYRING_ENVELOPE, list[i]))
+  return ["bash", "-c", script + "exit \"$rc\""]
 }
 
 // Secret-free summary: enabled methods, staleness, FIDO2 credentials and
@@ -2126,12 +2370,12 @@ function unlockEnvelopeOpenCommand(tool, account, via) {
   if (via.kind === "master" || via.kind === "pin") {
     var secret = via.kind === "master" ? KEYRING_SECRET_ENV : PIN_ENV
     script += "__k=\"$(__wrap_key '." + via.kind + "' \"$" + secret + "\")\" || exit $?; "
-      + "__unseal \"$__sealed\" | QSBW_UNLOCK_KEY=\"$__k\" " + open + " --via " + via.kind
+      + "__unseal \"$__sealed\" | " + open + " --via " + via.kind + toolSecrets([[TOOL_KEY, "\"$__k\""]])
   } else if (via.kind === "fingerprint") {
     script += "__unseal \"$__sealed\" | " + open + " --via fingerprint"
   } else if (via.kind === "fido" && ENVELOPE_BASE64_RE.test(String(via.cred || ""))) {
-    script += "__unseal \"$__sealed\" | QSBW_UNLOCK_KEY=\"$" + FIDO_HMAC_ENV + "\" " + open
-      + " --via fido --cred " + shellQuote(via.cred)
+    script += "__unseal \"$__sealed\" | " + open + " --via fido --cred " + shellQuote(via.cred)
+      + toolSecrets([[TOOL_KEY, "\"$" + FIDO_HMAC_ENV + "\""]])
   } else {
     return envelopeRefused()
   }
@@ -2147,9 +2391,9 @@ function unlockEnvelopeCreateCommand(tool, account) {
     + "__s=\"$(__salt)\"; "
     + "__k=\"$(" + envelopeNewKey("\"$" + KEYRING_SECRET_ENV + "\"", "__s") + ")\" || exit "
     + ENVELOPE_EXIT.kdf + "; "
-    + "__new=\"$(QSBW_UNLOCK_PASSWORD=\"$" + KEYRING_SECRET_ENV + "\" QSBW_UNLOCK_NEW_KEY=\"$__k\" "
-    + "\"$__tool\" create" + envelopeArgon2Args("__s") + " | __seal)\" "
-    + "|| exit $?; "
+    + "__new=\"$(\"$__tool\" create" + envelopeArgon2Args("__s")
+    + toolSecrets([[TOOL_PASSWORD, "\"$" + KEYRING_SECRET_ENV + "\""], [TOOL_NEW_KEY, "\"$__k\""]])
+    + " | __seal)\" || exit $?; "
     + "__verify_account \"$" + ENVELOPE_ACCOUNT_ID_ENV + "\" \"$" + ENVELOPE_SERVER_ENV + "\"; "
     + "__vk=\"$__k\"; __verify_opens \"$" + KEYRING_SECRET_ENV + "\""
     + " --via master; "
@@ -2179,12 +2423,12 @@ function unlockEnvelopeUpdateCommand(tool, account, op) {
   if (op.kind === "add-pin") {
     pre = masterKey + "__s=\"$(__salt)\"; "
       + "__pk=\"$(" + envelopeNewKey("\"$" + PIN_ENV + "\"", "__s") + ")\" || exit " + ENVELOPE_EXIT.kdf + "; "
-    transform = "QSBW_UNLOCK_KEY=\"$__mk\" QSBW_UNLOCK_NEW_KEY=\"$__pk\" \"$__tool\" add"
-      + " --auth master --method pin" + envelopeArgon2Args("__s")
+    transform = "\"$__tool\" add --auth master --method pin" + envelopeArgon2Args("__s")
+      + toolSecrets([[TOOL_KEY, "\"$__mk\""], [TOOL_NEW_KEY, "\"$__pk\""]])
     verifyOpen = "__vk=\"$__pk\"; __verify_opens \"$" + KEYRING_SECRET_ENV + "\" --via pin; "
   } else if (op.kind === "add-fingerprint") {
     pre = masterKey
-    transform = "QSBW_UNLOCK_KEY=\"$__mk\" \"$__tool\" add --auth master --method fingerprint"
+    transform = "\"$__tool\" add --auth master --method fingerprint" + toolSecrets([[TOOL_KEY, "\"$__mk\""]])
     verifyOpen = "__vk=''; __verify_opens \"$" + KEYRING_SECRET_ENV + "\" --via fingerprint; "
   } else if (op.kind === "add-fido") {
     // `saltFromEnv`: a fresh salt drawn earlier in the same pipeline.
@@ -2193,9 +2437,10 @@ function unlockEnvelopeUpdateCommand(tool, account, op) {
         || (!op.saltFromEnv && !ENVELOPE_BASE64_RE.test(String(op.salt || "")))
         || !op.rp || /[\x00-\x1f\x7f]/.test(String(op.rp))) return envelopeRefused()
     pre = masterKey
-    transform = "QSBW_UNLOCK_KEY=\"$__mk\" QSBW_UNLOCK_NEW_KEY=\"$" + FIDO_HMAC_ENV + "\" \"$__tool\" add"
+    transform = "\"$__tool\" add"
       + " --auth master --method fido --cred " + shellQuote(op.cred) + " --rp " + shellQuote(op.rp)
       + " --fido-salt " + saltArg
+      + toolSecrets([[TOOL_KEY, "\"$__mk\""], [TOOL_NEW_KEY, "\"$" + FIDO_HMAC_ENV + "\""]])
     verifyOpen = "__vk=\"$" + FIDO_HMAC_ENV + "\"; __verify_opens \"$" + KEYRING_SECRET_ENV + "\""
       + " --via fido --cred " + shellQuote(op.cred) + "; "
   } else if (op.kind === "remove") {
@@ -2210,22 +2455,23 @@ function unlockEnvelopeUpdateCommand(tool, account, op) {
     transform = "\"$__tool\" mark-stale"
   } else if (op.kind === "rotate" && op.auth) {
     var auth = op.auth
-    var authArgs = ""
+    var authKey = null
     if (auth.kind === "master" || auth.kind === "pin") {
       var authSecret = auth.kind === "master" ? KEYRING_SECRET_ENV : PIN_ENV
       pre = "__ak=\"$(__wrap_key '." + auth.kind + "' \"$" + authSecret + "\")\" || exit $?; "
-      authArgs = "QSBW_UNLOCK_KEY=\"$__ak\" "
+      authKey = [TOOL_KEY, "\"$__ak\""]
     } else if (auth.kind === "fido" && ENVELOPE_BASE64_RE.test(String(auth.cred || ""))) {
-      authArgs = "QSBW_UNLOCK_KEY=\"$" + FIDO_HMAC_ENV + "\" "
+      authKey = [TOOL_KEY, "\"$" + FIDO_HMAC_ENV + "\""]
     } else if (auth.kind !== "fingerprint") {
       return envelopeRefused()
     }
     pre += "__s=\"$(__salt)\"; "
       + "__nk=\"$(" + envelopeNewKey("\"$" + NEW_SECRET_ENV + "\"", "__s") + ")\" || exit " + ENVELOPE_EXIT.kdf + "; "
-    transform = authArgs + "QSBW_UNLOCK_PASSWORD=\"$" + NEW_SECRET_ENV + "\" QSBW_UNLOCK_NEW_KEY=\"$__nk\" "
-      + "\"$__tool\" rotate --auth " + auth.kind
+    var rotateSecrets = [[TOOL_PASSWORD, "\"$" + NEW_SECRET_ENV + "\""], [TOOL_NEW_KEY, "\"$__nk\""]]
+    if (authKey) rotateSecrets.unshift(authKey)
+    transform = "\"$__tool\" rotate --auth " + auth.kind
       + (auth.kind === "fido" ? " --auth-cred " + shellQuote(auth.cred) : "")
-      + envelopeArgon2Args("__s")
+      + envelopeArgon2Args("__s") + toolSecrets(rotateSecrets)
     verifyOpen = "__vk=\"$__nk\"; __verify_opens \"$" + NEW_SECRET_ENV + "\" --via master; "
   } else {
     return envelopeRefused()
@@ -2356,6 +2602,17 @@ function quickUnlockPurgeCommand(tool, slots, method) {
   if (typeof tool !== "string" || tool.charAt(0) !== "/" || !LEGACY_ENTRY_FOR_METHOD[method]) {
     return envelopeRefused()
   }
+  var list = uniqueAccountSlots(slots)
+  var script = "rc=0; "
+  for (var j = 0; j < list.length; j++) {
+    script += nestedScript(envelopeMethodPurgeScript(tool, list[j], method)) + " || rc=1; "
+      + keyringClearCheckedScript(keyringEntryName(LEGACY_ENTRY_FOR_METHOD[method], list[j]))
+  }
+  script += "exit \"$rc\""
+  return ["bash", "-c", script]
+}
+
+function uniqueAccountSlots(slots) {
   var seen = {}
   var list = []
   for (var i = 0; slots && i < slots.length; i++) {
@@ -2364,17 +2621,16 @@ function quickUnlockPurgeCommand(tool, slots, method) {
     seen[slot] = true
     list.push(slot)
   }
-  var script = "rc=0; "
-  for (var j = 0; j < list.length; j++) {
-    script += nestedScript(envelopeMethodPurgeScript(tool, list[j], method)) + " || rc=1; "
-      // libsecret's clear returns 1 without stderr when no matching item
-      // exists; service failures also return 1, with an error on stderr.
-      + "__clear_error=$(secret-tool clear" + keyringAttributes(keyringEntryName(LEGACY_ENTRY_FOR_METHOD[method], list[j]))
-      + " 2>&1 >/dev/null; __status=$?; printf '.'; exit \"$__status\"); __clear_rc=$?; __clear_error=\"${__clear_error%.}\"; "
-      + "if [ \"$__clear_rc\" -ne 0 ] && { [ \"$__clear_rc\" -ne 1 ] || [ -n \"$__clear_error\" ]; }; then rc=1; fi; "
-  }
-  script += "exit \"$rc\""
-  return ["bash", "-c", script]
+  return list
+}
+
+// Clears one keyring entry and sets rc=1 if that failed. libsecret's clear
+// returns 1 without stderr when no matching item exists; service failures
+// also return 1, with an error on stderr.
+function keyringClearCheckedScript(account) {
+  return "__clear_error=$(secret-tool clear" + keyringAttributes(account)
+    + " 2>&1 >/dev/null; __status=$?; printf '.'; exit \"$__status\"); __clear_rc=$?; __clear_error=\"${__clear_error%.}\"; "
+    + "if [ \"$__clear_rc\" -ne 0 ] && { [ \"$__clear_rc\" -ne 1 ] || [ -n \"$__clear_error\" ]; }; then rc=1; fi; "
 }
 
 // Checks a typed master password against the stored one, printing nothing:
@@ -2383,7 +2639,7 @@ function quickUnlockPurgeCommand(tool, slots, method) {
 function unlockEnvelopeCheckCommand(tool, account) {
   var open = unlockEnvelopeOpenCommand(tool, account, { kind: "master" })
   if (open[2] === envelopeRefused()[2]) return envelopeRefused()
-  return ["bash", "-c", nestedScript(open) + " >/dev/null"]
+  return ["bash", "-c", SECRETS_PREAMBLE + nestedScript(open) + " >/dev/null"]
 }
 
 // Quick unlock also needs `argon2` (ships with bitwarden-cli) and a working
@@ -2412,9 +2668,13 @@ function parseQuickUnlockPrereqs(raw) {
 
 // Verifies a typed master password with `bw` when there is no envelope to
 // check it against. `bw unlock` mints a new session key, which the caller
-// adopts.
+// adopts. The password comes in on stdin (KEYRING_SECRET_ENV record) and
+// reaches bw as a file that is a pipe, as the unlock's FIFO does, so it is
+// in no process's environment -- not even bw's, which --passwordenv would
+// need.
 function bwVerifyPasswordCommand() {
-  var script = "bw unlock --passwordenv " + KEYRING_SECRET_ENV + " --raw 2>/dev/null | head -c " + MAX_TOKEN_BYTES
+  var script = SECRETS_PREAMBLE
+    + "bw unlock --passwordfile <(printf '%s' \"$" + KEYRING_SECRET_ENV + "\") --raw 2>/dev/null | head -c " + MAX_TOKEN_BYTES
   return ["bash", "-c", cappedScript(script, MAX_STDERR_BYTES)]
 }
 
@@ -2431,11 +2691,11 @@ function legacyMigrationExitCodes() { return LEGACY_MIGRATION_EXIT }
 // (`passwordFromKeyring`) or is already in KEYRING_SECRET_ENV.
 function legacyMigrationCommand(tool, account, legacyAccount, addOp, passwordFromKeyring) {
   if (!envelopeArgsOk(tool, account)) return envelopeRefused()
-  var script = ""
+  var script = SECRETS_PREAMBLE
   if (passwordFromKeyring) {
     script += "__pw=\"$(" + keyringReadScript(keyringEntryName(legacyAccount, account.slot)) + ")\"; "
       + "[ -n \"$__pw\" ] || exit " + LEGACY_MIGRATION_EXIT.none + "; "
-      + "export " + KEYRING_SECRET_ENV + "=\"$__pw\"; unset __pw; "
+      + KEYRING_SECRET_ENV + "=\"$__pw\"; unset __pw; "
   } else {
     script += "[ -n \"${" + KEYRING_SECRET_ENV + ":-}\" ] || exit " + LEGACY_MIGRATION_EXIT.none + "; "
   }
@@ -2474,9 +2734,22 @@ function legacyPinMigrationCommand(tool, account) {
 // hmac-secret, which is the key to the envelope's FIDO wrap; the key requires
 // a touch for it. The random client data hash is discarded: only the
 // hmac-secret is used.
+//
+// A registration made with +pin or +verification asks the key's own PIN as
+// well (`target.needsPin`): fido2-assert runs with `-t pin=true`, which is
+// user verification, and the key then answers from its CredRandomWithUV, a
+// secret a touch alone never yields (CTAP 2.1 hmac-secret). So the wrap is
+// as strong as the registration, and a key that was only touched -- for a
+// sudo prompt, say, or by an attacker's own assertion -- cannot open it. The
+// PIN is typed into pinentry under the vault helper and arrives as the
+// FIDO_PIN_ENV record on stdin; fido2-assert reads it there because it has
+// no terminal (`setsid`): its readpassphrase() falls back to stdin when
+// /dev/tty cannot be opened. The assertion parameters, which are not secret,
+// then go in through `-i` so stdin carries the PIN alone.
 var FIDO_EXIT = {
-  assert: 31,     // fido2-assert failed: no touch in time, a refusal, or a busy key
+  assert: 31,     // fido2-assert failed: no touch in time, a refusal, a wrong PIN, or a busy key
   noSecret: 32,   // it answered, but without an hmac-secret
+  noPin: 33,      // the registration asks for the key's PIN and none arrived
   legacyUsed: 40  // unlocked with the old plaintext entry; migration did not finish
 }
 
@@ -2488,36 +2761,47 @@ function fidoTargetOk(target) {
     && typeof target.rp === "string" && /^pam:\/\/[A-Za-z0-9.-]+$/.test(target.rp)
 }
 
-// One touch; the hmac-secret for `saltExpr` is exported in FIDO_HMAC_ENV,
-// never as an argument.
+// One touch (and the key's PIN when the registration asks for it); the
+// hmac-secret for `saltExpr` lands in the FIDO_HMAC_ENV shell variable,
+// never exported, never an argument.
 function fidoAssertScript(target, saltExpr) {
+  var params = "printf '%s\\n%s\\n%s\\n%s\\n' \"$__cdh\" " + shellQuote(target.rp) + " "
+    + shellQuote(target.cred) + " " + saltExpr
+  var assert
+  if (target.needsPin) {
+    assert = "[ -n \"${" + FIDO_PIN_ENV + ":-}\" ] || exit " + FIDO_EXIT.noPin + "; "
+      + "__out=\"$(printf '%s\\n' \"$" + FIDO_PIN_ENV + "\" | setsid -w timeout 45 fido2-assert -G -h -t pin=true "
+      + "-i <(" + params + ") " + shellQuote(target.device) + " 2>/dev/null)\""
+  } else {
+    assert = "__out=\"$(" + params + " | timeout 45 fido2-assert -G -h " + shellQuote(target.device) + " 2>/dev/null)\""
+  }
   return "__cdh=\"$(head -c 32 /dev/urandom | base64 -w0)\"; "
-    + "__out=\"$(printf '%s\\n%s\\n%s\\n%s\\n' \"$__cdh\" " + shellQuote(target.rp) + " "
-    + shellQuote(target.cred) + " " + saltExpr + " | timeout 45 fido2-assert -G -h "
-    + shellQuote(target.device) + " 2>/dev/null)\" || exit " + FIDO_EXIT.assert + "; "
+    + assert + " || exit " + FIDO_EXIT.assert + "; "
     + "__hmac=\"$(printf '%s\\n' \"$__out\" | sed -n 5p)\"; unset __out; "
     + "[ -n \"$__hmac\" ] || exit " + FIDO_EXIT.noSecret + "; "
-    + "export " + FIDO_HMAC_ENV + "=\"$__hmac\"; unset __hmac; "
+    + FIDO_HMAC_ENV + "=\"$__hmac\"; unset __hmac; "
 }
 
 function fidoNewSaltScript() {
-  return "export " + FIDO_SALT_ENV + "=\"$(head -c 32 /dev/urandom | base64 -w0)\"; "
+  return FIDO_SALT_ENV + "=\"$(head -c 32 /dev/urandom | base64 -w0)\"; "
 }
 
-// Unlock through an existing FIDO wrap, using its salt.
+// Unlock through an existing FIDO wrap, using its salt. With
+// `target.needsPin`, the key's PIN is the FIDO_PIN_ENV record on stdin.
 function fidoUnlockCommand(tool, account, target) {
   if (!envelopeArgsOk(tool, account) || !fidoTargetOk(target)
       || !ENVELOPE_BASE64_RE.test(String(target.salt || ""))) return envelopeRefused()
-  var script = fidoAssertScript(target, shellQuote(target.salt))
+  var script = SECRETS_PREAMBLE + fidoAssertScript(target, shellQuote(target.salt))
     + nestedScript(unlockEnvelopeOpenCommand(tool, account, { kind: "fido", cred: target.cred }))
   return ["bash", "-c", cappedScript(script, MAX_STDERR_BYTES)]
 }
 
-// Adds a FIDO wrap: the typed master password authorizes, one touch gives the
-// hmac-secret for a fresh salt. Exit 10: no envelope yet.
+// Adds a FIDO wrap: the typed master password authorizes, one touch (and the
+// key's PIN, as for unlocking) gives the hmac-secret for a fresh salt. Exit
+// 10: no envelope yet.
 function fidoEnrollCommand(tool, account, target) {
   if (!envelopeArgsOk(tool, account) || !fidoTargetOk(target)) return envelopeRefused()
-  var script = fidoNewSaltScript() + fidoAssertScript(target, "\"$" + FIDO_SALT_ENV + "\"")
+  var script = SECRETS_PREAMBLE + fidoNewSaltScript() + fidoAssertScript(target, "\"$" + FIDO_SALT_ENV + "\"")
     + nestedScript(unlockEnvelopeUpdateCommand(tool, account,
       { kind: "add-fido", cred: target.cred, rp: target.rp, saltFromEnv: true }))
   return ["bash", "-c", cappedScript(script, MAX_STDERR_BYTES)]
@@ -2530,10 +2814,11 @@ function fidoLegacyUnlockCommand(tool, account, target) {
   if (!envelopeArgsOk(tool, account) || !fidoTargetOk(target)) return envelopeRefused()
   var migrate = legacyMigrationCommand(tool, account, KEYRING_FIDO,
     { kind: "add-fido", cred: target.cred, rp: target.rp, saltFromEnv: true }, false)
-  var script = "__pw=\"$(" + keyringReadScript(keyringEntryName(KEYRING_FIDO, account.slot)) + ")\"; "
+  var script = SECRETS_PREAMBLE
+    + "__pw=\"$(" + keyringReadScript(keyringEntryName(KEYRING_FIDO, account.slot)) + ")\"; "
     + "[ -n \"$__pw\" ] || exit " + LEGACY_MIGRATION_EXIT.none + "; "
     + fidoNewSaltScript() + fidoAssertScript(target, "\"$" + FIDO_SALT_ENV + "\"")
-    + "export " + KEYRING_SECRET_ENV + "=\"$__pw\"; "
+    + KEYRING_SECRET_ENV + "=\"$__pw\"; "
     + "if " + nestedScript(migrate) + " >/dev/null; then "
     + nestedScript(unlockEnvelopeOpenCommand(tool, account, { kind: "fido", cred: target.cred }))
     + " && exit 0; fi; "
@@ -5155,16 +5440,24 @@ function uwsmWriteCommand() {
 }
 
 // Removes everything the plugin stores outside its folder (keyring, state,
-// data), since `omarchy plugin remove` has no uninstall hook. Leaves bw's own
-// sign-in (the default account) and shell.json alone; the other accounts'
-// sign-ins live in the plugin's data and go with it.
+// data, and the keyring repair's backups), since `omarchy plugin remove` has
+// no uninstall hook. Leaves bw's own sign-in (the default account) and
+// shell.json alone; the other accounts' sign-ins live in the plugin's data
+// and go with it.
 function pluginDataRemoveCommand() {
   var script = "test -n \"${HOME:-}\" || exit " + PLUGIN_DATA_EXIT_NO_HOME + "; "
     + "__state=\"${XDG_STATE_HOME:-$HOME/.local/state}/qs-bitwarden-cli\"; "
     + "__data=\"${XDG_DATA_HOME:-$HOME/.local/share}/qs-bitwarden-cli\"; "
+    + "__keyrings=\"${XDG_DATA_HOME:-$HOME/.local/share}/keyrings\"; "
     // Each step reports independently; one failing does not stop the rest.
     + "__done=''; "
     + "if secret-tool clear service qs-bitwarden-cli 2>/dev/null; then __done=\"$__done keyring\"; fi; "
+    // scripts/repair-keyring.sh keeps the keyring file it rewrote as
+    // <file>.before-repair-<time>: a copy of every secret in it. Only files
+    // of exactly that name beside the default keyring, nothing else there.
+    + "if [ -d \"$__keyrings\" ] && [ ! -L \"$__keyrings\" ] "
+    + "&& find \"$__keyrings\" -maxdepth 1 -type f -name 'Default_keyring.keyring.before-repair-*' | grep -q .; then "
+    + "  find \"$__keyrings\" -maxdepth 1 -type f -name 'Default_keyring.keyring.before-repair-*' -delete && __done=\"$__done backups\"; fi; "
     + "if [ -e \"$__state\" ]; then rm -rf -- \"$__state\" && __done=\"$__done state\"; fi; "
     + "if [ -d \"$__data/accounts\" ] && [ ! -L \"$__data/accounts\" ] "
     + "&& find \"$__data/accounts\" -mindepth 1 -maxdepth 1 -type d -name '????????????????' | grep -q .; "
@@ -5190,6 +5483,7 @@ function parsePluginDataRemoval(exitCode, stdout) {
   if (line.indexOf("state") >= 0) cleared.push("learned suggestions")
   if (line.indexOf("data") >= 0) cleared.push("exported public keys")
   if (line.indexOf("accounts") >= 0) cleared.push("the sign-ins of accounts added in the panel")
+  if (line.indexOf("backups") >= 0) cleared.push("the keyring repair's backup copies")
   if (cleared.length === 0) {
     return { ok: true, message: "Nothing was left to remove." }
   }
@@ -5345,27 +5639,35 @@ function sshAuthSockDiagnostic(sock, runtimeDir) {
 // Shipped helpers are checked before use: present, executable, right
 // architecture, matching checksum, passing self-test, matching protocol.
 // SHA256SUMS sits beside the binary, so it catches stale or incomplete files,
-// not tampering; provenance is covered by the release attestation.
+// not tampering; provenance is covered by the release attestation. A shipped
+// binary is never run before its line in SHA256SUMS has matched it: a
+// missing manifest used to leave the checksum "unchecked" and the helper
+// running, which hid an incomplete install behind a green state.
 var SSH_AGENT_BUNDLED_RELATIVE = "bin/x86_64-linux/qs-bitwarden-ssh-agent"
 var SSH_AGENT_SUMS_RELATIVE = "bin/SHA256SUMS"
-// Cargo's debug build, used when the shipped binary is absent or unusable;
-// the settings screen names which one is running.
+// Cargo's debug build. Tried only with `allowDevelopmentHelpers` set to
+// `true` in shell.json (a source checkout), never on its own: it has no
+// digest and no provenance, and a plugin install falling back to one is a
+// broken install, not a working one. The settings screen names which one is
+// running.
 var SSH_AGENT_DEVELOPMENT_RELATIVE = "agent/target/debug/qs-bitwarden-ssh-agent"
 
-// In preference order: shipped artifact, then local build.
-function helperCandidates(pluginDir, spec) {
+// In preference order: shipped artifact, then the local build when allowed.
+function helperCandidates(pluginDir, spec, allowDevelopment) {
   var root = cleanAbsoluteDir(pluginDir)
   if (!root) return []
-  return [
-    { source: "bundled", path: root + "/" + spec.bundled },
-    { source: "development", path: root + "/" + spec.development }
-  ]
+  var candidates = [{ source: "bundled", path: root + "/" + spec.bundled }]
+  if (allowDevelopment === true) {
+    candidates.push({ source: "development", path: root + "/" + spec.development })
+  }
+  return candidates
 }
 
 // The absolute path of the candidate the inspection accepted, or "". Never a
-// guess: an unaccepted source launches nothing.
+// guess: an unaccepted source launches nothing. Only an inspection that was
+// allowed the development build reports it, so it is offered here too.
 function helperPath(pluginDir, spec, source) {
-  var candidates = helperCandidates(pluginDir, spec)
+  var candidates = helperCandidates(pluginDir, spec, true)
   for (var i = 0; i < candidates.length; i++) {
     if (candidates[i].source === source) return candidates[i].path
   }
@@ -5390,37 +5692,45 @@ function sshAgentHelperSourceLabel(source) {
   return ""
 }
 
-// Checks both candidates in one shell and reports the first usable one as
+// Checks the candidates in one shell and reports the first usable one as
 // `key=value` lines; none of the helper's own output reaches a message.
 // `spec` gives the binary name, candidate paths and the sed expression that
-// reads its protocol version from `--version`.
-function helperInspectCommand(pluginDir, spec) {
+// reads its protocol version from `--version`. `allowDevelopment` (only a
+// literal true) adds the local build after the shipped one.
+function helperInspectCommand(pluginDir, spec, allowDevelopment) {
   var root = cleanAbsoluteDir(pluginDir)
   if (!root) return ["bash", "-c", "echo state=missing"]
   // The binary's line in SHA256SUMS: its path relative to bin/, exactly.
   var sumsPath = spec.bundled.replace(/^bin\//, "")
   var sumsLine = "^[0-9a-f]{64}  " + sumsPath.replace(/[.]/g, "\\.") + "$"
+  var pairs = helperCandidates(root, spec, allowDevelopment).map(function(c) {
+    return shellQuote(c.source + ":" + c.path.slice(root.length + 1))
+  })
 
   var script = "__root=" + shellQuote(root) + "; "
     + "__report() { printf '%s\\n' \"$@\"; exit 0; }; "
     + "__found=''; "
-    // Shipped first; a local build only if that is absent or unusable.
-    + "for __pair in " + shellQuote("bundled:" + spec.bundled)
-    + " " + shellQuote("development:" + spec.development) + "; do "
+    // Shipped first; a local build, when allowed, only if that is absent or
+    // unusable.
+    + "for __pair in " + pairs.join(" ") + "; do "
     + "  __source=\"${__pair%%:*}\"; __rel=\"${__pair#*:}\"; __bin=\"$__root/$__rel\"; "
     + "  [ -e \"$__bin\" ] || continue; "
     + "  __found=\"$__source\"; "
     + "  [ -f \"$__bin\" ] || { __state=not-a-file; continue; }; "
     + "  [ -x \"$__bin\" ] || { __state=not-executable; continue; }; "
-    // ELF magic first, so LFS placeholders and truncated files fail clearly.
+    // A shipped binary with no manifest beside it is an incomplete install:
+    // nothing more is read of it, and it is not run, not even for `--version`.
+    + "  __checksum=unchecked; "
+    + "  if [ \"$__source\" = bundled ] && [ ! -f \"$__root/" + SSH_AGENT_SUMS_RELATIVE + "\" ]; then "
+    + "    __checksum=missing; __state=checksum-missing; continue; fi; "
+    // ELF magic next, so LFS placeholders and truncated files fail clearly.
     + "  __magic=\"$(head -c 4 -- \"$__bin\" 2>/dev/null | od -An -tx1 | tr -d ' \\n')\"; "
     + "  [ \"$__magic\" = \"7f454c46\" ] || { __state=not-elf; continue; }; "
     + "  __arch=\"$(od -An -tx1 -j 18 -N 1 -- \"$__bin\" 2>/dev/null | tr -d ' \\n')\"; "
     + "  [ \"$__arch\" = \"3e\" ] || { __state=wrong-architecture; continue; }; "
     // Shipped artifact only, and only its own SHA256SUMS line, so one stale
     // helper cannot disable the other. A missing line is a mismatch.
-    + "  __checksum=unchecked; "
-    + "  if [ \"$__source\" = bundled ] && [ -f \"$__root/" + SSH_AGENT_SUMS_RELATIVE + "\" ]; then "
+    + "  if [ \"$__source\" = bundled ]; then "
     + "    __line=\"$(grep -E " + shellQuote(sumsLine) + " \"$__root/" + SSH_AGENT_SUMS_RELATIVE + "\" | head -1)\"; "
     + "    if [ -n \"$__line\" ] && ( cd \"$__root/bin\" && printf '%s\\n' \"$__line\" | sha256sum -c --status ) 2>/dev/null; then "
     + "      __checksum=match; "
@@ -5450,8 +5760,8 @@ var SSH_AGENT_HELPER_SPEC = {
   protocolSed: "s/.*protocol \\([0-9]*\\).*/\\1/p"
 }
 
-function sshAgentHelperInspectCommand(pluginDir) {
-  return helperInspectCommand(pluginDir, SSH_AGENT_HELPER_SPEC)
+function sshAgentHelperInspectCommand(pluginDir, allowDevelopment) {
+  return helperInspectCommand(pluginDir, SSH_AGENT_HELPER_SPEC, allowDevelopment)
 }
 
 // A helper's state before its inspection has run.
@@ -5495,6 +5805,9 @@ function helperMessages(noun, manifest, protocolMismatch) {
       + "release ships x86_64 only.",
     "checksum-mismatch": the + " does not match its recorded checksum. That usually "
       + "means a stale binary after an update, or an incomplete clone.",
+    "checksum-missing": the + " has no recorded checksum: bin/SHA256SUMS is missing, so the "
+      + "install is incomplete and the shipped binary is not run. Reinstall the plugin; a "
+      + "source checkout can set allowDevelopmentHelpers to use its own build.",
     "no-version": the + " did not report a usable version.",
     "self-test-failed": the + " failed its own self-test on this machine.",
     "protocol-mismatch": the + " " + protocolMismatch + " than this version of the plugin. "
@@ -5524,9 +5837,10 @@ function helperReady(inspection) {
 // helper. If it fails, only quick unlock is disabled.
 var UNLOCK_KEY_ENVELOPE_VERSION = 1
 // The command-line contract the builders above speak. v2 reads the account from
-// QSBW_ACCOUNT_ID and QSBW_SERVER instead of --account-id and --server, so a
-// v1 binary (which would refuse the missing flags) is turned away up front.
-var UNLOCK_KEY_CLI_VERSION = 2
+// QSBW_ACCOUNT_ID and QSBW_SERVER instead of --account-id and --server; v3
+// takes secrets on `--secrets-fd`, never from the environment. An older
+// binary (which would read neither) is turned away up front.
+var UNLOCK_KEY_CLI_VERSION = 3
 var UNLOCK_KEY_BUNDLED_RELATIVE = "bin/x86_64-linux/qs-bitwarden-unlock-key"
 var UNLOCK_KEY_DEVELOPMENT_RELATIVE = "unlock-key/target/debug/qs-bitwarden-unlock-key"
 
@@ -5537,8 +5851,8 @@ var UNLOCK_KEY_SPEC = {
   protocolSed: "s/.*cli v\\([0-9]*\\).*/\\1/p"
 }
 
-function unlockKeyInspectCommand(pluginDir) {
-  return helperInspectCommand(pluginDir, UNLOCK_KEY_SPEC)
+function unlockKeyInspectCommand(pluginDir, allowDevelopment) {
+  return helperInspectCommand(pluginDir, UNLOCK_KEY_SPEC, allowDevelopment)
 }
 
 var UNLOCK_KEY_MESSAGES = helperMessages("quick-unlock tool", "unlock-key/Cargo.toml",
@@ -5562,7 +5876,9 @@ function parseUnlockKeyInspection(raw) {
 // Shipped and inspected like the other helpers. If it is missing or fails,
 // the panel works as before (the session and secrets in the shell) and says
 // crash protection is off.
-var VAULT_HELPER_PROTOCOL = 1
+// 2: `secrets`/`heldSecrets` on exec, written to the run's stdin
+// (secretBlock()) instead of its environment.
+var VAULT_HELPER_PROTOCOL = 2
 // What `session` holds while the helper has the key: the helper prints this
 // in the key's place, shaped like a key so the panel's parsing is unchanged.
 var VAULT_HELD_SESSION = "HELD-BY-QS-BITWARDEN-VAULT-HELPER-SESSION"
@@ -5591,8 +5907,8 @@ var VAULT_HELPER_SPEC = {
   protocolSed: "s/.*protocol \\([0-9]*\\).*/\\1/p"
 }
 
-function vaultHelperInspectCommand(pluginDir) {
-  return helperInspectCommand(pluginDir, VAULT_HELPER_SPEC)
+function vaultHelperInspectCommand(pluginDir, allowDevelopment) {
+  return helperInspectCommand(pluginDir, VAULT_HELPER_SPEC, allowDevelopment)
 }
 
 var VAULT_HELPER_MESSAGES = helperMessages("vault helper", "vault/Cargo.toml",
@@ -5628,9 +5944,18 @@ function vaultHelperLine(type, fields) {
 }
 
 // A run's request: `env` values are strings, or null to unset; `inject`
-// names a held value per variable ("session" or "secret:<name>").
-function vaultExecLine(id, argv, env, inject, capture, stdin) {
+// names a held value per variable ("session" or "secret:<name>"). `secrets`
+// (values) and `heldSecrets` (names, as `inject`) go to the run's stdin
+// instead, ahead of `stdin`; `secrets` is sent whenever given, even empty,
+// so the script's reader never waits (SECRETS_PREAMBLE).
+function vaultExecLine(id, argv, env, inject, capture, stdin, secrets, heldSecrets) {
   var fields = { id: id, argv: argv, env: vaultEnv(env || {}), inject: inject || {}, capture: capture || "plain" }
+  if (secrets !== undefined && secrets !== null) {
+    var values = {}
+    for (var k in secrets) values[k] = String(secrets[k] === undefined || secrets[k] === null ? "" : secrets[k])
+    fields.secrets = values
+  }
+  if (heldSecrets && Object.keys(heldSecrets).length > 0) fields.heldSecrets = heldSecrets
   if (stdin !== undefined && stdin !== null && stdin !== "") fields.stdin = String(stdin)
   return vaultHelperLine("exec", fields)
 }

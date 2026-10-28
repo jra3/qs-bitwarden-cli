@@ -552,8 +552,44 @@ const wipe = Model.pluginDataRemoveCommand().join(" ")
 for (const [what, needle] of [
   ["the keyring entries", "secret-tool clear service qs-bitwarden-cli"],
   ["the learned suggestions", "XDG_STATE_HOME"],
-  ["the exported public keys", "XDG_DATA_HOME"]
+  ["the exported public keys", "XDG_DATA_HOME"],
+  ["the keyring repair's backups", "Default_keyring.keyring.before-repair-*"]
 ]) check(`removal clears ${what}`, wipe.indexOf(needle) >= 0, wipe)
+check("and only files of that exact name beside the keyring, never the keyring itself",
+  /find "\$__keyrings" -maxdepth 1 -type f -name 'Default_keyring\.keyring\.before-repair-\*' -delete/.test(wipe)
+    && !/rm -rf[^;]*keyrings/.test(wipe), wipe)
+check("a removed backup is named in the result",
+  /backup/.test(Model.parsePluginDataRemoval(0, "removed backups").message),
+  Model.parsePluginDataRemoval(0, "removed backups").message)
+
+// The removal for real, in a HOME of its own with secret-tool stubbed: the
+// repair's backups go, the keyring and its neighbours stay.
+{
+  const os = require("os")
+  const { spawnSync } = require("child_process")
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "qsbw-plugin-data-"))
+  try {
+    const bin = path.join(home, "bin")
+    fs.mkdirSync(bin)
+    fs.writeFileSync(path.join(bin, "secret-tool"), "#!/bin/sh\nexit 0\n", { mode: 0o755 })
+    const keyrings = path.join(home, ".local", "share", "keyrings")
+    fs.mkdirSync(keyrings, { recursive: true })
+    const keep = ["Default_keyring.keyring", "login.keyring", "Default_keyring.keyring.bak"]
+    const go = ["Default_keyring.keyring.before-repair-20260101-010101", "Default_keyring.keyring.before-repair-20260102-020202"]
+    for (const f of keep.concat(go)) fs.writeFileSync(path.join(keyrings, f), "[keyring]\n", { mode: 0o600 })
+    const cmd = Model.pluginDataRemoveCommand()
+    const run = spawnSync(cmd[0], cmd.slice(1), { encoding: "utf8",
+      env: { PATH: `${bin}:/usr/bin:/bin`, HOME: home } })
+    check("the removal runs clean in a HOME of its own", run.status === 0, run.stderr)
+    check("it reports the backups among what went", /backups/.test(run.stdout), run.stdout)
+    check("the repair's backups are gone", go.every(f => !fs.existsSync(path.join(keyrings, f))), fs.readdirSync(keyrings).join())
+    check("the keyring and its neighbours are not", keep.every(f => fs.existsSync(path.join(keyrings, f))), fs.readdirSync(keyrings).join())
+    const again = spawnSync(cmd[0], cmd.slice(1), { encoding: "utf8", env: { PATH: `${bin}:/usr/bin:/bin`, HOME: home } })
+    check("with none left, none are claimed", again.status === 0 && !/backups/.test(again.stdout), again.stdout)
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true })
+  }
+}
 check("and never logs the vault out on its own",
   wipe.indexOf("bw logout") < 0 && wipe.indexOf("bw ") < 0, wipe)
 check("nor touches the shell's own settings file",

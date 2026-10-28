@@ -43,7 +43,7 @@ function vault(extra) {
     onEnvelopePinResult: () => { v.pinUnlockSubmitted = false; v.pinBusy = false }
   }, extra || {})
   v.root = v
-  bind(v, ["forgetHeldPassword", "queueEnvelopeJob", "pumpEnvelopeJobs", "onEnvelopeJobExited",
+  bind(v, ["forgetHeldPassword", "forgetJobSecrets", "queueEnvelopeJob", "pumpEnvelopeJobs", "onEnvelopeJobExited",
     "authAttemptInFlight", "unlockJobInFlight", "envelopeUnlockJobPending", "recheckStatusAfterUnlock",
     "onPinJobDropped", "submitPinUnlock", "releaseHeldPin", "openEnvelopeForFingerprint",
     "cancelEnvelopeUnlockJobs"])

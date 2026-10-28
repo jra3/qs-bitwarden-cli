@@ -83,7 +83,7 @@ gh attestation verify bin/x86_64-linux/qs-bitwarden-ssh-agent \
 
 `gh` is not an Omarchy dependency, so this is a check you run if you want it, not one the plugin can assume. Worth re-running after a plugin update, when the binary has changed.
 
-**When the check fails.** The panel disables SSH support, names the reason, and leaves the rest of the plugin working. If a locally built helper is present it falls back to that instead and says so on a banner -- which is the state to be careful about, because signing carries on with a binary that has no recorded digest and no provenance behind it. Either way the fix is to restore the shipped artifact:
+**When the check fails.** The panel disables SSH support, names the reason, and leaves the rest of the plugin working. A missing `SHA256SUMS` counts as a failure: the shipped binary is not run before its line has matched it. If a locally built helper is present *and* `allowDevelopmentHelpers` is `true` in `shell.json` it falls back to that instead and says so on a banner -- which is the state to be careful about, because signing carries on with a binary that has no recorded digest and no provenance behind it. Either way the fix is to restore the shipped artifact:
 
 ```bash
 omarchy plugin remove io.github.elevate08.qs-bitwarden-cli

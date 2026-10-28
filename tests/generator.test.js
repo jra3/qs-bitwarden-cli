@@ -348,6 +348,16 @@ check("a value from the previous option set cannot be copied while regeneration 
     && /enabled:\s*!root\.genBusy\s*&&\s*root\.genValue\s*!==\s*""/.test(panelSrc),
   bodyOf("copyGenerated") + "\n" + bodyOf("useGeneratedPassword"))
 
+// `bw serve` answers anything on its socket (/unlock included), so it runs
+// only while the generator screen is up: leaving the screen for any reason,
+// a lock included (which sets currentScreen to "locked"), and closing the
+// panel both stop it. The Process is a managed child, so it dies with the
+// shell.
+check("bw serve stops whenever the screen is no longer the generator",
+  /onCurrentScreenChanged:\s*\{[\s\S]{0,600}?if \(currentScreen !== "generator"\) stopGeneratorServe\(\)/.test(panelSrc), "")
+check("and when the panel closes", /stopGeneratorServe\(\)/.test(bodyOf("close")), bodyOf("close"))
+check("a lock leaves the generator screen, which stops it",
+  /currentScreen = "locked"/.test(bodyOf("lockVault")), bodyOf("lockVault"))
 const stopGenerator = bodyOf("stopGeneratorServe")
 check("canceling an in-flight generator request cannot leave generation wedged busy",
   /genBusy\s*=\s*false/.test(stopGenerator)

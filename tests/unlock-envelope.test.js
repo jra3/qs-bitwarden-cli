@@ -2,8 +2,9 @@
 // The envelope's keyring commands, run for real: the actual pipelines, real
 // `argon2`, `jq` and qs-bitwarden-unlock-key, and a file-backed `secret-tool`.
 // `systemd-creds` is a stand-in (CI lacks `--user`), and the suite reruns
-// against the real one where it works. Every tool logs its argv, and no
-// secret may appear there.
+// against the real one where it works. Every tool logs its argv and its
+// environment, and no secret may appear in either: secrets reach a pipeline
+// on stdin, as the vault helper writes them (Model.secretBlock()).
 //
 // Needs: argon2, jq, and unlock-key/target/debug/qs-bitwarden-unlock-key.
 //
@@ -38,6 +39,8 @@ const SECRET = Model.keyringSecretEnvVar()
 const PIN = Model.pinEnvVar()
 const NEW_SECRET = Model.envelopeNewSecretEnvVar()
 const HMAC = Model.FIDO_HMAC_ENV
+const KEY_PIN = Model.fidoPinEnvVar()
+const KEY_PIN_VALUE = "9137"
 const ACCOUNT = { id: "user-1234", server: "https://vault.bitwarden.com" }
 
 // Awkward on purpose: quotes, a dollar, a backslash and a trailing newline
@@ -56,7 +59,10 @@ const FIDO_CRED_ELSEWHERE = Buffer.alloc(64, 0xc3).toString("base64")
 function fakeBin(dir, realCreds) {
   const bin = path.join(dir, "bin")
   fs.mkdirSync(bin)
-  const log = `printf '%s\\0' "$(basename "$0")" "$@" >> "$ARGV_LOG"; printf '\\n' >> "$ARGV_LOG"`
+  // The argv, and any QSBW_ variable in the environment: a secret the shell
+  // exported, or one the helper would have put there, shows up in ENV_LOG.
+  const log = `printf '%s\\0' "$(basename "$0")" "$@" >> "$ARGV_LOG"; printf '\\n' >> "$ARGV_LOG"; `
+    + `/usr/bin/env | grep '^QSBW_' | sed "s/^/$(basename "$0"): /" >> "$ENV_LOG" || true`
   const write = (name, body) => fs.writeFileSync(path.join(bin, name), `#!/bin/bash\n${log}\n${body}\n`, { mode: 0o755 })
 
   // A keyring that is a directory: one file per `account` attribute.
@@ -84,14 +90,26 @@ esac`)
 
   // Holds FAKE_FIDO_CREDS, answers only when touched (not FAKE_FIDO_FAIL), and
   // derives a deterministic hmac-secret per credential and salt; logs each.
+  // With \`-t pin=true\` it reads the PIN from stdin, as the real one does
+  // without a terminal, takes the parameters from \`-i\`, refuses a PIN other
+  // than FAKE_FIDO_PIN, and answers from another secret (CredRandomWithUV).
   write("fido2-assert", `
-hmac=0; for a in "$@"; do [ "$a" = -h ] && hmac=1; done
+hmac=0; pin=0; infile=""
+while [ $# -gt 0 ]; do case "$1" in -h) hmac=1;; -t) [ "$2" = pin=true ] && pin=1; shift;; -i) infile="$2"; shift;; esac; shift; done
 [ -z "\${FAKE_FIDO_FAIL:-}" ] || exit 1
-IFS= read -r cdh; IFS= read -r rp; IFS= read -r cred; salt=""; [ $hmac = 1 ] && IFS= read -r salt
+if [ -n "$infile" ]; then exec 4<"$infile"; else exec 4<&0; fi
+IFS= read -r cdh <&4; IFS= read -r rp <&4; IFS= read -r cred <&4; salt=""; [ $hmac = 1 ] && IFS= read -r salt <&4
+uv=""
+if [ $pin = 1 ]; then
+  [ -t 0 ] && exit 1
+  IFS= read -r given; printf '%s\n' "$given" >> "$PIN_LOG"
+  [ "$given" = "$FAKE_FIDO_PIN" ] || exit 1
+  uv="uv"
+fi
 case ",$FAKE_FIDO_CREDS," in *",$cred,"*) ;; *) exit 1 ;; esac
 printf '%s\n%s\nauthdata\nsignature\n' "$cdh" "$rp"
 if [ $hmac = 1 ]; then
-  secret="$(printf '%s|%s|%s' fake-device-key "$cred" "$salt" | openssl dgst -sha256 -binary | base64 -w0)"
+  secret="$(printf '%s|%s|%s|%s' fake-device-key "$cred" "$salt" "$uv" | openssl dgst -sha256 -binary | base64 -w0)"
   printf '%s\n' "$secret" >> "$HMAC_LOG"
   printf '%s\n' "$secret"
 fi`)
@@ -123,6 +141,8 @@ function suite(realCreds) {
     const store = path.join(dir, "store")
     fs.mkdirSync(store)
     const argvLog = path.join(dir, "argv.log")
+    const envLog = path.join(dir, "env.log")
+    const pinLog = path.join(dir, "pin.log")
     const hmacLog = path.join(dir, "hmac.log")
     const tool = path.join(bin, "unlock-tool")
     const stored = () => {
@@ -130,19 +150,24 @@ function suite(realCreds) {
       return fs.existsSync(f) ? fs.readFileSync(f, "utf8") : null
     }
 
+    // `secrets` go in on stdin as the helper writes them; `extra` is plain
+    // environment for the stand-ins.
     const run = (cmd, secrets, extra) => {
       const env = Object.assign({
         PATH: `${bin}:/usr/bin:/bin`,
         HOME: process.env.HOME || dir,
         STORE_DIR: store,
         ARGV_LOG: argvLog,
+        ENV_LOG: envLog,
+        PIN_LOG: pinLog,
         HMAC_LOG: hmacLog,
-        FAKE_FIDO_CREDS: [FIDO_CRED_A, FIDO_CRED_B].join(",")
+        FAKE_FIDO_CREDS: [FIDO_CRED_A, FIDO_CRED_B].join(","),
+        FAKE_FIDO_PIN: KEY_PIN_VALUE
       }, Model.envelopeAccountEnv(ACCOUNT), realCreds ? {
         XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR || "",
         DBUS_SESSION_BUS_ADDRESS: process.env.DBUS_SESSION_BUS_ADDRESS || ""
-      } : {}, secrets || {}, extra || {})
-      const r = spawnSync(cmd[0], cmd.slice(1), { env, encoding: "buffer", timeout: 120000 })
+      } : {}, extra || {})
+      const r = spawnSync(cmd[0], cmd.slice(1), { env, input: Buffer.from(Model.secretBlock(secrets || {}), "utf8"), encoding: "buffer", timeout: 120000 })
       return { code: r.status, out: r.stdout.toString("utf8"), err: r.stderr.toString("utf8") }
     }
     const summary = () => {
@@ -318,6 +343,35 @@ function suite(realCreds) {
     eq(tag + "another salt yields another secret, which opens nothing",
       run(Model.fidoUnlockCommand(tool, ACCOUNT, Object.assign(onKey(FIDO_CRED_A), { salt: FIDO_SALT }))).code, 3)
 
+    // --- a registration that asks for the key's PIN (+pin, +verification) ---
+    //
+    // The PIN is user verification: the key answers from another secret, so
+    // a wrap made with it cannot be opened by a touch alone, and the PIN
+    // itself goes to fido2-assert on stdin, never anywhere a process list or
+    // environment would show it.
+    const withPin = (cred) => Object.assign(onKey(cred), { needsPin: true })
+    eq(tag + "a PIN registration cannot enroll without the PIN",
+      run(Model.fidoEnrollCommand(tool, ACCOUNT, withPin(FIDO_CRED_B)), { [SECRET]: plain }).code, F.noPin)
+    eq(tag + "or with a wrong one",
+      run(Model.fidoEnrollCommand(tool, ACCOUNT, withPin(FIDO_CRED_B)), { [SECRET]: plain, [KEY_PIN]: "0000" }).code, F.assert)
+    eq(tag + "the PIN, the password and a touch enroll it",
+      run(Model.fidoEnrollCommand(tool, ACCOUNT, withPin(FIDO_CRED_B)), { [SECRET]: plain, [KEY_PIN]: KEY_PIN_VALUE }).code, 0)
+    const wrapBPin = wrapOf(FIDO_CRED_B)
+    eq(tag + "the PIN and a touch unlock through it",
+      run(Model.fidoUnlockCommand(tool, ACCOUNT, Object.assign(withPin(FIDO_CRED_B), { salt: wrapBPin.salt })),
+        { [KEY_PIN]: KEY_PIN_VALUE }).out, plain)
+    eq(tag + "a touch alone yields a secret that opens nothing",
+      run(Model.fidoUnlockCommand(tool, ACCOUNT, Object.assign(onKey(FIDO_CRED_B), { salt: wrapBPin.salt }))).code, 3)
+    eq(tag + "and no PIN at unlock is reported as such, before the key is asked",
+      run(Model.fidoUnlockCommand(tool, ACCOUNT, Object.assign(withPin(FIDO_CRED_B), { salt: wrapBPin.salt }))).code, F.noPin)
+    const pinsSeen = fs.readFileSync(pinLog, "utf8").trim().split("\n")
+    check(tag + "the stand-in key read the PIN from its stdin",
+      pinsSeen.includes(KEY_PIN_VALUE) && pinsSeen.includes("0000"), JSON.stringify(pinsSeen))
+    check(tag + "the PIN-made wrap is a different secret from a touch-only one",
+      Model.fidoUnlockCommand(tool, ACCOUNT, Object.assign(withPin(FIDO_CRED_B), { salt: wrapBPin.salt }))[2].includes("-t pin=true")
+        && !Model.fidoUnlockCommand(tool, ACCOUNT, Object.assign(onKey(FIDO_CRED_B), { salt: wrapBPin.salt }))[2].includes("pin=true"), "")
+    eq(tag + "removing that wrap", run(Model.unlockEnvelopeUpdateCommand(tool, ACCOUNT, { kind: "remove", method: "fido", cred: FIDO_CRED_B })).code, 0)
+
     // The first touch after upgrading: no wrap for this credential yet, but
     // the old plaintext entry is there. The same touch migrates it.
     const legacyFido = path.join(store, "fido_password")
@@ -382,13 +436,24 @@ function suite(realCreds) {
     eq(tag + "clearing removes it", stored(), null)
     eq(tag + "and presence says so", run(Model.keyringHasEntryCommand(Model.KEYRING_ENVELOPE)).out.trim(), "no")
 
-    // --- nothing secret in any argv ---
+    // --- nothing secret in any argv, and nothing of ours in any environment ---
     const argv = fs.readFileSync(argvLog, "utf8")
     const secrets = { "the password": "horse", "the new password": NEW_PASSWORD, "the PIN": PIN_VALUE,
-      "the hmac-secret": HMAC_VALUE }
+      "the hmac-secret": HMAC_VALUE, "the key's PIN": KEY_PIN_VALUE }
     for (const [what, value] of Object.entries(secrets)) {
       check(tag + `${what} never appeared in an argv`, !argv.includes(value), "found in the argv log")
     }
+    const environ = fs.existsSync(envLog) ? fs.readFileSync(envLog, "utf8") : ""
+    // The account (QSBW_ACCOUNT_ID, QSBW_SERVER) is the one thing the runner
+    // exports, and it is not a secret.
+    const secretEnviron = environ.split("\n").filter(l => l && !/^[^:]+: QSBW_(ACCOUNT_ID|SERVER)=/.test(l)).join("\n")
+    check(tag + "no secret QSBW_ variable reached any tool's environment: secrets came in on stdin and stayed in the shell",
+      secretEnviron === "", secretEnviron.slice(0, 300))
+    for (const [what, value] of Object.entries(secrets)) {
+      check(tag + `${what} never appeared in an environment`, !environ.includes(value), "found in the env log")
+    }
+    check(tag + "the unlock tool took its secrets on a descriptor, with nothing in its argv but the number",
+      /unlock-tool\0[^\n]*--secrets-fd\x003\x00/.test(argv) && !/unlock-tool\0[^\n]*QSBW_UNLOCK/.test(argv), "")
     const keySecrets = fs.existsSync(hmacLog) ? fs.readFileSync(hmacLog, "utf8").trim().split("\n").filter(Boolean) : []
     check(tag + "no secret a key handed out ever appeared in an argv",
       keySecrets.length > 0 && keySecrets.every(k => !argv.includes(k)), "found in the argv log")
@@ -451,8 +516,49 @@ if (realCreds.status === 0) {
     /argon2/.test(Model.parseQuickUnlockPrereqs("argon2=0\ncreds=1\n").message), "")
   eq("both present is ready", Model.parseQuickUnlockPrereqs("argon2=1\ncreds=1\n").ready, true)
 }
-check("bw checks a typed password from the environment, never argv",
-  /bw unlock --passwordenv QSBW_SECRET --raw/.test(Model.bwVerifyPasswordCommand()[2]), Model.bwVerifyPasswordCommand()[2])
+check("bw checks a typed password through a pipe it reads as a file, never argv or environment",
+  /bw unlock --passwordfile <\(printf '%s' "\$QSBW_SECRET"\) --raw/.test(Model.bwVerifyPasswordCommand()[2])
+    && Model.bwVerifyPasswordCommand()[2].startsWith(Model.secretsPreamble().slice(0, 40), Model.bwVerifyPasswordCommand()[2].indexOf("if [ -z"))
+    && !/passwordenv/.test(Model.bwVerifyPasswordCommand()[2]), Model.bwVerifyPasswordCommand()[2])
+// Every pipeline that takes a secret starts by reading the stdin block, and
+// a nested step is a subshell: it inherits the shell's variables without an
+// environment, and its own preamble reads nothing.
+{
+  const preamble = Model.secretsPreamble()
+  const takes = [
+    Model.unlockEnvelopeOpenCommand("/t", ACCOUNT, { kind: "master" }),
+    Model.unlockEnvelopeCreateCommand("/t", ACCOUNT),
+    Model.unlockEnvelopeUpdateCommand("/t", ACCOUNT, { kind: "add-pin" }),
+    Model.unlockEnvelopeCheckCommand("/t", ACCOUNT),
+    Model.legacyPinMigrationCommand("/t", ACCOUNT),
+    Model.fidoUnlockCommand("/t", ACCOUNT, { device: "/dev/hidraw1", cred: CRED, rp: "pam://h", salt: FIDO_SALT }),
+    Model.fidoEnrollCommand("/t", ACCOUNT, { device: "/dev/hidraw1", cred: CRED, rp: "pam://h" }),
+    Model.pinUnlockCommand(),
+    Model.bwVerifyPasswordCommand()
+  ]
+  check("every secret-taking pipeline reads the stdin block before anything else",
+    takes.every(c => c[2].indexOf(preamble) !== -1 && c[2].indexOf(preamble) < 80), takes.map(c => c[2].slice(0, 60)).join("\n"))
+  check("the preamble reads once per process and never exports",
+    /__secrets_read=1/.test(preamble) && /read -r -d ''/.test(preamble) && !/export/.test(preamble)
+      && /printf -v "\$__n"/.test(preamble), preamble)
+  const nested = Model.unlockEnvelopeCheckCommand("/t", ACCOUNT)[2]
+  check("a nested step is a subshell, not a bash -c with an environment",
+    /\( exec 2>/.test(nested) && !/bash -c/.test(nested), nested.slice(0, 200))
+  check("no pipeline exports a secret or puts one in a command's environment",
+    takes.every(c => !/export QSBW|QSBW_UNLOCK_[A-Z_]*=|-pass env:|--passwordenv/.test(c[2])), "")
+  check("the unlock tool gets its secrets on descriptor 3 from the builtin printf",
+    takes.slice(0, 6).every(c => /--secrets-fd 3 3< <\(__feed /.test(c[2])), "")
+  const pinned = Model.fidoUnlockCommand("/t", ACCOUNT, { device: "/dev/hidraw1", cred: CRED, rp: "pam://h", salt: FIDO_SALT, needsPin: true })[2]
+  check("a PIN registration runs fido2-assert with user verification, the PIN on stdin and the parameters in -i, with no terminal",
+    /printf '%s\\n' "\$QSBW_FIDO_PIN" \| setsid -w timeout 45 fido2-assert -G -h -t pin=true -i <\(printf/.test(pinned), pinned.slice(0, 600))
+  check("and refuses to ask the key when no PIN came",
+    /\[ -n "\$\{QSBW_FIDO_PIN:-\}" \] \|\| exit 33/.test(pinned), "")
+  check("a touch-only registration is unchanged: parameters on stdin, no uv",
+    /\| timeout 45 fido2-assert -G -h '\/dev\/hidraw1'/.test(Model.fidoUnlockCommand("/t", ACCOUNT, { device: "/dev/hidraw1", cred: CRED, rp: "pam://h", salt: FIDO_SALT })[2]), "")
+  const block = Model.secretBlock({ A: "x=y\n", "bad name": "z", B_2: "" })
+  eq("the panel's own block is NUL-ended records closed by an empty one, names checked",
+    JSON.stringify(block), JSON.stringify("A=x=y\n\u0000B_2=\u0000\u0000"))
+}
 
 // -------------------------------------------------------------------------
 // Builders refuse what should never reach them

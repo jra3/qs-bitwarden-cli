@@ -21,6 +21,8 @@ ShellRoot {
                               autoLockMinutes: 0, lockOnScreenLock: false, lockOnSuspend: false,
                               sshAgentEnabled: Quickshell.env("QSBW_E2E_SSH_AGENT") === "1",
                               allowVaultWithoutHelper: Quickshell.env("QSBW_E2E_ALLOW_NO_HELPER") === "1",
+                              // The suites run the helper built in vault/target/debug.
+                              allowDevelopmentHelpers: true,
                               pinentryProgram: Quickshell.env("QSBW_E2E_PINENTRY") || "" })
     function showPopout() { opened = true }
     function hidePopout() { opened = false }

@@ -2,6 +2,124 @@
 
 ## [Unreleased]
 
+### Security
+
+- **The master password is typed into pinentry on every screen, and a new
+  PIN too.** The email and API-key login's master password, and the master
+  password confirmed when turning on PIN, fingerprint or FIDO2 unlock, went
+  into the panel's own fields, so a shell crash after one of those could
+  leave them in the shell's core dump (the unlock and re-prompt already used
+  pinentry). They now go through the same pinentry under the vault helper,
+  which holds each under a name and feeds it to `bw login`, the FIFO writer
+  or the envelope tool itself; the shell learns only whether you answered. A
+  new PIN is typed twice in one pinentry window and checked there (length,
+  digits, match); a pinentry that cannot take a repeat is refused rather than
+  trusted, and the panel offers its fields. "Type it here instead" works as
+  before: only on your choice, and never remembered. Nothing changes with
+  pinentry off or missing. Requires no helper rebuild: the helper's existing
+  named-secret capture and injection carry it.
+
+- **Locking ends the copies still on the clipboard.** The vault helper hands
+  a copied password to `wl-copy` with a timed clear, but a copy that had
+  started just before a lock kept serving the password until its own timer
+  ran out, past the lock-time clear. The helper now keeps a list of the
+  copies it has serving and ends them when the panel locks, logs out or
+  switches accounts. The timed clear is still the copy's own, so it survives
+  a shell or helper crash as before.
+- **A shipped helper is not run without its checksum line.** With
+  `bin/SHA256SUMS` missing the check reported the helper usable with its
+  checksum "unchecked" and ran it; it now refuses it as an incomplete
+  install. The `target/debug` fallback is no longer automatic: a source
+  checkout sets `allowDevelopmentHelpers` to `true` in `shell.json` to use
+  its own builds.
+- **Lock on screen lock sees a `hyprlock` started by hand.** The poll asked
+  only the shell's lock plugin; it now also reads the compositor's session
+  lock through `omarchy-hyprland-session-locked`, and either locks the
+  vault. A reading the compositor cannot give locks nothing but keeps SSH
+  prompts off the screen.
+- **The terminal login hands its session key over a pipe, not a file.** The
+  key used to sit in a file under `$XDG_RUNTIME_DIR` until the panel read it
+  or ten minutes passed; it now waits in the terminal shell's memory and
+  crosses a named pipe the panel opens once, and nothing lands on the
+  filesystem.
+- **The keyring repair's backups expire.** `scripts/repair-keyring.sh` kept
+  the whole keyring file it rewrote, every application's secrets included,
+  with no end. Its backups are now mode `600`, removed after 30 days by the
+  start-up check, and removed at once by **Remove Plugin Data**; the
+  uninstall page says how by hand.
+
+- **A remembered session no longer falls back to the on-disk keyring.** With
+  `rememberSession` on, the session key was written to libsecret's
+  memory-only `session` collection, and when that store failed (a secret
+  service without one, D-Bus trouble) to the default collection instead,
+  which on Omarchy is a plaintext file under `~/.local/share/keyrings`. The
+  boot-id stamp is checked by the panel alone; `bw` accepts the key from that
+  file until `bw lock`. The store now goes only to the session collection,
+  is checked afterwards (an item that landed anywhere else is removed again),
+  and a refusal leaves the session unremembered, with a message and a note
+  on the settings row saying why.
+- **The vault locks at shutdown and reboot.** The shell is killed then, not
+  unloaded, so the unload-time `bw lock` never ran, and a remembered
+  session's key stayed valid in `bw` after the keyring's memory-only copy
+  was gone. The logind monitor that handles suspend now also takes
+  `PrepareForShutdown`, under a shutdown delay inhibitor, and locks whatever
+  `lockOnSuspend` and `rememberSession` say; it runs whenever the plugin
+  does. An unload while unlocked now locks unless a checked keyring copy
+  will reopen the session.
+- **A keyring clear that could not be checked is no longer reported as
+  done.** The clear's check counted the output of a `secret-tool search`
+  and dropped its status, so a secret service that was not answering read
+  as "nothing left"; the entry could come back with the service. The search
+  status is kept, and such a clear is reported as unchecked.
+- **The master password, the PIN and the FIDO2 key's secret no longer pass
+  through any process's environment.** The envelope pipelines took them in
+  the shell's environment, which every child (`secret-tool`, `systemd-creds`,
+  `jq`, `head`, `cmp`, `argon2`) inherited and any program running as you
+  could read from `/proc/<pid>/environ` for the length of an unlock; the
+  key's `hmac-secret`, which opens the key's way in again from anywhere, was
+  exported into a nested shell too. They now reach the pipeline on its stdin,
+  as records the vault helper writes, live in unexported shell variables, and
+  reach the unlock tool on a descriptor of its own (`--secrets-fd`); the tool
+  reads only the account from its environment. `bw`'s own check of a typed
+  password reads a pipe as its `--passwordfile` instead of `--passwordenv`,
+  and an older version's PIN blob is decrypted with the PIN on a descriptor.
+  Both helpers' protocols change for this (vault protocol 2, unlock tool
+  command interface v3), so a plugin updated without its helpers reports them as
+  mismatched rather than putting the values back in the environment.
+  See [docs/vault-helper.md](docs/vault-helper.md#where-the-secrets-of-quick-unlock-travel).
+- **The FIDO2 key is asked for a touch only when you press the button.** The
+  locked panel armed the key whenever it opened with a key plugged in, so a
+  touch given to anything else meanwhile (`sudo`, SSH) unlocked the vault,
+  and the secret that touch produced is the same every time. The key now
+  waits for **Unlock with FIDO2 Key**, and the request is dropped when the
+  screen is left.
+- **Registrations that ask for the key's PIN (`+pin`, `+verification`) are
+  supported, and are stronger.** They were refused. The PIN is typed into
+  pinentry under the vault helper, never into the panel, and `fido2-assert`
+  runs with user verification, so the key answers from its verified secret:
+  a touch alone, or a touch given for another prompt, cannot open that way
+  in.
+- **Adding a fingerprint or PIN way in beside a FIDO2 one (or the reverse)
+  warns and asks for a second press**, since the weaker method is then what
+  protects the stored password.
+- **No master-password-only envelope.** A typed unlock stored the password,
+  encrypted, even with every quick-unlock method off, and nothing removed it:
+  an offline guessing target nobody had asked for. It is now written only
+  while a quick-unlock method is turned on (or being turned on), one left
+  with no method is removed at the next start, every account's alike, and `storeMasterPassword:
+  false` in `shell.json` never writes it at all.
+
+### Changed
+
+- **The helpers can be rebuilt from a linked worktree.**
+  `scripts/build-agent.sh` re-executes itself in the pinned image with the
+  checkout mounted, which fails in a `git worktree` checkout (the gitdir is
+  outside the mount) and leaves root-owned files in a primary one.
+  `scripts/rebuild-helpers-local.sh` clones HEAD to a temporary directory
+  on the host and runs the same script there as the invoking user, then
+  copies the result into `bin/` on request. The release build itself is
+  unchanged.
+
 ## [1.11.8] - 2026-10-26
 
 ### Security

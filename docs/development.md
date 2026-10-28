@@ -34,6 +34,11 @@ header says what it covers; run them all the way CI does:
 for t in tests/*.test.js; do node "$t" || echo "FAILED: $t"; done
 ```
 
+A source checkout runs its own helper builds (`*/target/debug/`) in place of
+the shipped ones only with `"allowDevelopmentHelpers": true` in the plugin's
+`shell.json` entry; without it a missing or stale `bin/` disables the feature
+instead of falling back, as it does for an installed plugin.
+
 The helpers have their own Rust tests:
 
 ```bash

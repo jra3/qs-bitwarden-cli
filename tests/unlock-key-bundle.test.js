@@ -48,7 +48,8 @@ eq("the development path is cargo's debug output for its own package",
   Model.UNLOCK_KEY_DEVELOPMENT_RELATIVE, "unlock-key/target/debug/qs-bitwarden-unlock-key")
 eq("the panel reads envelope v1", Model.UNLOCK_KEY_ENVELOPE_VERSION, 1)
 // v2: the account comes in QSBW_ACCOUNT_ID / QSBW_SERVER, not --account-id / --server.
-eq("the panel speaks command interface v2", Model.UNLOCK_KEY_CLI_VERSION, 2)
+// v3: secrets come on a descriptor (--secrets-fd), never the environment.
+eq("the panel speaks command interface v3", Model.UNLOCK_KEY_CLI_VERSION, 3)
 
 // -------------------------------------------------------------------------
 // The inspection, run against real files
@@ -58,24 +59,33 @@ function inTemp(fn) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "qsbw-unlock-bundle-"))
   try { return fn(dir) } finally { fs.rmSync(dir, { recursive: true, force: true }) }
 }
-const inspect = (pluginDir) => {
-  const cmd = Model.unlockKeyInspectCommand(pluginDir)
+const inspect = (pluginDir, allowDevelopment) => {
+  const cmd = Model.unlockKeyInspectCommand(pluginDir, allowDevelopment)
   const run = spawnSync(cmd[0], cmd.slice(1), { encoding: "utf8", env: { PATH: "/usr/bin:/bin" } })
   return Model.parseUnlockKeyInspection(run.stdout)
 }
-// A binary to copy into fixtures: the shipped one when it is tracked, the
-// local build otherwise.
-const sample = fs.existsSync(bundled) ? bundled : development
+// A binary to copy into fixtures: the shipped one when it is tracked and
+// speaks this command interface, the local build otherwise. A tracked binary
+// built before v3 is a mismatch, not a sample.
+const interfaceOf = bin => (spawnSync(bin, ["--version"], { encoding: "utf8" }).stdout.match(/cli v(\d+)/) || [])[1]
+const bundledStale = fs.existsSync(bundled) && interfaceOf(bundled) !== String(Model.UNLOCK_KEY_CLI_VERSION)
+const sample = fs.existsSync(bundled) && !bundledStale ? bundled : development
 
 {
   const result = inspect(repoRoot)
-  eq("this checkout's unlock tool is usable", result.state, "ok")
-  eq("and it is the shipped one when one is tracked",
-    result.source, fs.existsSync(bundled) ? "bundled" : "development")
-  check("its version is reported", /^\d+\.\d+\.\d+$/.test(result.version), result.version)
-  eq("its command interface version is the panel's", result.protocol, 2)
-  eq("its self-test passed", result.selfTest, "pass")
-  eq("quick unlock would be offered", Model.helperReady(result), true)
+  if (bundledStale) {
+    eq("the stale tracked tool is refused by its command interface version (bin/ must be rebuilt)", result.state, "protocol-mismatch")
+    eq("and quick unlock is not offered with it", Model.helperReady(result), false)
+    check("the message says why", /uses a different command interface/.test(result.message), result.message)
+  } else {
+    eq("this checkout's unlock tool is usable", result.state, "ok")
+    eq("and it is the shipped one when one is tracked",
+      result.source, fs.existsSync(bundled) ? "bundled" : "development")
+    check("its version is reported", /^\d+\.\d+\.\d+$/.test(result.version), result.version)
+    eq("its command interface version is the panel's", result.protocol, 3)
+    eq("its self-test passed", result.selfTest, "pass")
+    eq("quick unlock would be offered", Model.helperReady(result), true)
+  }
 }
 
 inTemp(dir => {
@@ -90,16 +100,29 @@ check("a sample binary exists to build fixtures from", fs.existsSync(sample),
   "neither a tracked tool nor unlock-key/target/debug -- run `cargo build` in unlock-key/")
 
 if (fs.existsSync(sample)) {
-  // A local build with nothing shipped: the development loop keeps working.
+  // A local build with nothing shipped: the development loop keeps working,
+  // once shell.json (allowDevelopmentHelpers) says it is one.
   inTemp(dir => {
     const target = path.join(dir, "unlock-key", "target", "debug")
     fs.mkdirSync(target, { recursive: true })
     fs.copyFileSync(sample, path.join(target, "qs-bitwarden-unlock-key"))
     fs.chmodSync(path.join(target, "qs-bitwarden-unlock-key"), 0o755)
-    const result = inspect(dir)
+    eq("a development build is not used unless asked for", inspect(dir).state, "missing")
+    const result = inspect(dir, true)
     eq("a development build is usable", result.state, "ok")
     eq("and is identified as such", result.source, "development")
     eq("no checksum is claimed for it", result.checksum, "unchecked")
+  })
+
+  // Shipped with no manifest beside it: not run, and quick unlock stays off.
+  inTemp(dir => {
+    const target = path.join(dir, "bin", "x86_64-linux")
+    fs.mkdirSync(target, { recursive: true })
+    fs.copyFileSync(sample, path.join(target, "qs-bitwarden-unlock-key"))
+    fs.chmodSync(path.join(target, "qs-bitwarden-unlock-key"), 0o755)
+    const result = inspect(dir)
+    eq("a shipped tool without SHA256SUMS is refused", result.state, "checksum-missing")
+    eq("and quick unlock stays off", Model.helperReady(result), false)
   })
 
   // Shipped but stale: its line names other bytes.
@@ -136,8 +159,12 @@ if (fs.existsSync(sample)) {
 // The panel, not the shell, decides whether a command interface is one it
 // can drive: a v1 tool (flags for the account) would be refused, not misused.
 {
-  const newer = Model.parseUnlockKeyInspection("state=ok\nsource=bundled\nversion=0.2.0\nprotocol=1\n")
+  const newer = Model.parseUnlockKeyInspection("state=ok\nsource=bundled\nversion=0.2.0\nprotocol=4\n")
   eq("a command interface the panel does not speak is refused", newer.state, "protocol-mismatch")
+  eq("so is v2, which read secrets from the environment",
+    Model.parseUnlockKeyInspection("state=ok\nsource=bundled\nversion=0.1.0\nprotocol=2\n").state, "protocol-mismatch")
+  eq("and v1, which took the account as flags",
+    Model.parseUnlockKeyInspection("state=ok\nsource=bundled\nversion=0.1.0\nprotocol=1\n").state, "protocol-mismatch")
   check("and the message says to reinstall", /Reinstall/.test(newer.message), newer.message)
 }
 

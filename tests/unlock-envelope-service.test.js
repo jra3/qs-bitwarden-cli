@@ -41,8 +41,10 @@ check("the only other caller is an enable form, after bw has checked the passwor
   `${callers} occurrences`)
 
 const loginOutput = bodyOf("onLoginOutput")
+// loginSecret() is the field, or a reference to what pinentry took; the name
+// is handed over with it (not forgotten), and the unlock forgets it after.
 check("a login hands its typed password over before clearing it",
-  /pendingUnlockPassword = String\(loginPassword \|\| ""\)\s*\n\s*pendingUnlockFrom = ""\s*\n\s*loginPassword = ""/
+  /pendingUnlockPassword = loginSecret\(\)\s*\n\s*pendingUnlockFrom = ""\s*\n\s*loginMasterName = ""\s*\n\s*loginPassword = ""/
     .test(loginOutput), loginOutput.slice(loginOutput.indexOf("rememberTwoFactorMethod"), 2000))
 check("the writer creates, replaces or rotates, and nothing else",
   /unlockEnvelopeCreateCommand/.test(bodyOf("storeAcceptedMasterPassword"))
@@ -56,11 +58,14 @@ check("the old plaintext fingerprint writer is gone",
 // Enable forms check; they do not store
 // -------------------------------------------------------------------------
 
-const fpSetup = bodyOf("submitFingerprintSetup")
+// The form's submit takes the field (or asks pinentry); saveFingerprintSetup()
+// is the write both reach.
+const fpSubmit = bodyOf("submitFingerprintSetup")
+const fpSetup = bodyOf("saveFingerprintSetup")
 check("fingerprint setup adds a wrap through the master-password check",
   /addQuickUnlockMethod\(typed, \{ kind: "add-fingerprint" \}/.test(fpSetup), fpSetup)
 check("and drops the typed password as soon as it is handed over",
-  /var typed = fpSetupMaster\s*\n\s*fpSetupMaster = ""/.test(fpSetup), fpSetup)
+  /var typed = fpSetupMaster\s*\n\s*fpSetupMaster = ""\s*\n\s*saveFingerprintSetup\(typed\)/.test(fpSubmit), fpSubmit)
 check("a wrong password is named as such",
   /root\.fpError = root\.quickUnlockErrorText\(why,/.test(fpSetup)
     && /why === "wrong-password"\) return "That is not your master password\."/.test(bodyOf("quickUnlockErrorText")), fpSetup)
@@ -126,9 +131,53 @@ check("an unlock that returns no key, or whose password never reached bw, forget
 // 1. A changed password with no method set up used to leave an envelope that
 //    nothing could open again, and every enable form calling the right password
 //    wrong. With only the master wrap there is nothing to keep: recreate.
-check("a master-only envelope is recreated when bw accepts a password it refuses",
-  /else if \(!root\.envelopeHasMethods\(\)\) \{[\s\S]{0,700}?unlockEnvelopeCreateCommand\(tool, account\), env, finish\)/
+check("a master-only envelope is recreated when bw accepts a password it refuses, if a method will use it",
+  /else if \(!root\.envelopeHasMethods\(\)\) \{[\s\S]{0,700}?if \(!forMethod && !root\.quickUnlockWanted\(\)\) \{ finish\(false\); return \}\s*root\.writeEnvelope\(Model\.unlockEnvelopeCreateCommand\(tool, account\), secrets, finish\)/
     .test(writer), writer)
+// With no method turned on there is nothing the stored password is for, and
+// a copy only the password opens is still something to guess at offline.
+check("no envelope is created for a typed unlock while no quick-unlock method is on",
+  /code === E\.absent \|\| code === 6 \|\| code === E\.unseal\) \{[\s\S]{0,500}?if \(!forMethod && !root\.quickUnlockWanted\(\)\) \{ finish\(false\); return \}/
+    .test(writer), writer)
+check("an enable form may create one, since its method is about to use it",
+  /root\.storeAcceptedMasterPassword\(pw, function\(stored\) \{[\s\S]{0,600}?\}, true\)/.test(bodyOf("addQuickUnlockMethodWith"))
+    && /return fingerprintUnlock \|\| fidoUnlock \|\| pinUnlock/.test(bodyOf("quickUnlockWanted")), bodyOf("addQuickUnlockMethodWith"))
+check("the unlock path creates none on its own account",
+  !/storeAcceptedMasterPassword\(pendingUnlockPassword[^)]*, true\)/.test(bodyOf("onUnlockSuccess")), bodyOf("onUnlockSuccess"))
+check("an envelope found with no method in it and none turned on is removed, not kept as a guessing target",
+  /if \(envelopeHasMethods\(\) \|\| quickUnlockWanted\(\) \|\| envelopeJobs\.length > 0 \|\| !accountId\) return false/.test(bodyOf("reconcileMasterOnlyEnvelope"))
+    && /quickUnlockEnableGraceMs\) return false/.test(bodyOf("reconcileMasterOnlyEnvelope"))
+    && /purgeUnwantedEnvelope\(\)/.test(bodyOf("reconcileMasterOnlyEnvelope"))
+    && /root\.reconcileMasterOnlyEnvelope\(\)\) return/.test(bodyOf("refreshEnvelope")), bodyOf("reconcileMasterOnlyEnvelope"))
+check("a purge that failed for another account is retried once the active envelope is gone",
+  /code === Model\.envelopeExitCodes\(\)\.absent && root\.envelopePurgeFailed\)\)\s*&& root\.reconcileMasterOnlyEnvelope\(\)\) return/.test(bodyOf("refreshEnvelope"))
+    && /root\.envelopePurgeFailed = code !== 0/.test(bodyOf("purgeUnwantedEnvelope")), bodyOf("refreshEnvelope"))
+check("storeMasterPassword: false in shell.json turns quick unlock off and removes a stored envelope",
+  /readonly property bool storeMasterPassword: setting\("storeMasterPassword", true\) !== false/.test(service)
+    && /readonly property bool quickUnlockAvailable: unlockKeyReady && quickUnlockPrereqs\.ready && storeMasterPassword/.test(service)
+    && /if \(!storeMasterPassword\) \{\s*purgeUnwantedEnvelope\(\)\s*return\s*\}/.test(bodyOf("refreshEnvelope"))
+    && /storeMasterPassword/.test(Model.storeMasterPasswordOffReason()), "")
+check("it is not in the settings screen",
+  !/storeMasterPassword/.test(read("BitwardenModel.js").split("SETTINGS_SCHEMA")[1] || ""), "")
+check("the purge clears the envelope entry of every account",
+  /keyringClearCheckedScript\(keyringEntryName\(KEYRING_ENVELOPE, list\[i\]\)\)/.test(read("BitwardenModel.js").match(/function unlockEnvelopeClearCommand[\s\S]*?\n\}/)[0])
+    && /Model\.unlockEnvelopeClearCommand\(accountSlotsForPurge\(\)\), writes: true/.test(bodyOf("purgeUnwantedEnvelope")), "")
+check("a failed purge keeps the summary and says so",
+  /if \(code === 0\) \{\s*root\.envelopeSummary = null/.test(bodyOf("purgeUnwantedEnvelope"))
+    && /\} else \{\s*root\.errorMessage = "Could not remove the stored master password/.test(bodyOf("purgeUnwantedEnvelope")), bodyOf("purgeUnwantedEnvelope"))
+// --- a weaker method beside the key -----------------------------------------
+check("adding a fingerprint or PIN wrap beside a FIDO2 wrap warns and needs a second press",
+  /if \(fpDowngradeWarning && !fpDowngradeConfirmed\) \{\s*fpDowngradeConfirmed = true\s*fpError = Model\.downgradeConfirmText/.test(bodyOf("submitFingerprintSetup"))
+    && /if \(pinDowngradeWarning && !pinDowngradeConfirmed\) \{\s*pinDowngradeConfirmed = true\s*pinError = Model\.downgradeConfirmText/.test(bodyOf("submitPinSetup"))
+    && /fpDowngradeConfirmed = false/.test(bodyOf("beginFingerprintSetup"))
+    && /pinDowngradeConfirmed = false/.test(bodyOf("beginPinSetup")), "")
+check("the warning names what is lost, for each direction",
+  /method === "fingerprint" && hasFido/.test(bodyOf("quickUnlockDowngradeWarning"))
+    && /method === "pin" && hasFido/.test(bodyOf("quickUnlockDowngradeWarning"))
+    && /method === "fido" && \(hasFingerprint \|\| hasPin\)/.test(bodyOf("quickUnlockDowngradeWarning"))
+    && /Press Enable again/.test(Model.downgradeConfirmText("x")), "")
+check("the setup screens show it",
+  /root\.vault\.fpDowngradeWarning !== ""/.test(panel) && /root\.vault\.pinDowngradeWarning !== ""/.test(panel), "")
 check("and an unread summary counts as having methods, so nothing is dropped on a guess",
   /if \(!envelopeSummary\) return envelopeChecked \? false : true/.test(bodyOf("envelopeHasMethods")),
   bodyOf("envelopeHasMethods"))
@@ -161,12 +210,24 @@ check("envelope jobs run one at a time",
   /if \(envelopeProc\.running \|\| envelopeJob !== null \|\| envelopeJobs\.length === 0\) return/
     .test(bodyOf("pumpEnvelopeJobs")), bodyOf("pumpEnvelopeJobs"))
 check("a job's secrets are dropped the moment it starts",
-  /envelopeProc\.environment = Object\.assign\(\{\}, job\.accountEnv \|\| \{\}, job\.env \|\| \{\}\)\s*\n\s*job\.env = null/.test(bodyOf("pumpEnvelopeJobs"))
-    && /envelopeProc\.environment = \{\}/.test(bodyOf("onEnvelopeJobExited")),
+  /envelopeProc\.secrets = job\.secrets \|\| \{\}\s*\n\s*job\.env = null\s*\n\s*job\.secrets = null/.test(bodyOf("pumpEnvelopeJobs"))
+    && /envelopeProc\.environment = \{\}\s*\n\s*envelopeProc\.secrets = \{\}/.test(bodyOf("onEnvelopeJobExited")),
   bodyOf("pumpEnvelopeJobs"))
 check("every job carries the account in its environment, not its argv",
-  /job\.accountEnv = Model\.envelopeAccountEnv\(envelopeAccount\(\)\)/.test(bodyOf("queueEnvelopeJob")),
+  /job\.accountEnv = Model\.envelopeAccountEnv\(envelopeAccount\(\)\)/.test(bodyOf("queueEnvelopeJob"))
+    && /envelopeProc\.environment = Object\.assign\(\{\}, job\.accountEnv \|\| \{\}, job\.env \|\| \{\}\)/.test(bodyOf("pumpEnvelopeJobs")),
   bodyOf("queueEnvelopeJob"))
+// The typed password, a PIN and the key's PIN go to the run's stdin, where
+// only that process reads them; nothing of theirs is in any environment.
+check("no envelope job puts a secret in a process environment",
+  !/env\[Model\.(keyringSecretEnvVar|pinEnvVar|envelopeNewSecretEnvVar|fidoPinEnvVar)\(\)\]/.test(service)
+    && !/bwEnv\(env\)/.test(bodyOf("verifyWithBw")) && /secrets: secrets/.test(bodyOf("verifyWithBw")), "")
+check("a job that will not run takes its held secrets with it",
+  /function forgetJobSecrets\(job\)[\s\S]{0,300}?for \(var key in job\.secrets\) forgetHeldPassword\(job\.secrets\[key\]\)/.test(service)
+    && /forgetJobSecrets\(job\)/.test(bodyOf("cancelEnvelopeUnlockJobs")) && /forgetJobSecrets\(job\)/.test(bodyOf("dropEnvelopeState")), "")
+check("the legacy PIN blob takes the PIN on stdin too",
+  /VaultProcess \{\s*id: pinUnlockProc[\s\S]{0,300}?secrets: root\.pinSecrets\(/.test(service)
+    && !/id: pinUnlockProc[\s\S]{0,300}?environment:/.test(service), "")
 check("a job that printed the password has its collector scrubbed",
   /job\.secretOutput\) clearProcessCollectorSoon\(envelopeProc\)/.test(bodyOf("onEnvelopeJobExited")),
   bodyOf("onEnvelopeJobExited"))
@@ -202,13 +263,17 @@ check("settings state the floor rule where it applies",
 // -------------------------------------------------------------------------
 
 const pinSetup = bodyOf("submitPinSetup")
+// The form's submit validates the fields (or asks pinentry, which checks the
+// PIN itself); savePinSetup() is the write both reach.
+const pinSave = bodyOf("savePinSetup")
 check("PIN setup adds a wrap through the master-password check, with the PIN in the environment",
-  /addQuickUnlockMethod\(typed, \{ kind: "add-pin" \}, pin,/.test(pinSetup)
-    && /pin\[Model\.pinEnvVar\(\)\] = pinSetupPin/.test(pinSetup), pinSetup)
+  /addQuickUnlockMethod\(typed, \{ kind: "add-pin" \}, pinEnv,/.test(pinSave)
+    && /pinEnv\[Model\.pinEnvVar\(\)\] = pin/.test(pinSave)
+    && /savePinSetup\(typed, pinSetupPin\)/.test(pinSetup), pinSave)
 check("PIN rules: validated first, numeric, the setup floor",
   /Model\.validatePin\(pinSetupPin, pinSetupConfirm\)/.test(pinSetup), pinSetup)
 check("a wrong master password is named as such",
-  /root\.pinError = root\.quickUnlockErrorText\(why,/.test(pinSetup), pinSetup)
+  /root\.pinError = root\.quickUnlockErrorText\(why,/.test(pinSave), pinSave)
 check("the old PIN-blob writer is gone",
   !/pinStoreProc|onPinStored|Model\.pinStoreCommand/.test(service), "still referenced")
 const pinUnlock = bodyOf("submitPinUnlock")
@@ -247,7 +312,7 @@ check("a key whose password was changed elsewhere is kept, and feeds the re-seal
   /pendingUnlockFrom === "fido" && fidoFromEnvelope\) \{[\s\S]{0,600}?rotationOldPassword = pendingUnlockPassword/
     .test(unlockOutput), "")
 check("the enable path that touches a key shares the master-password check and bw fallback",
-  /function addQuickUnlockMethodWith\(password, makeCommand, extraEnv, done\)/.test(service)
+  /function addQuickUnlockMethodWith\(password, makeCommand, extraSecrets, done\)/.test(service)
     && /addQuickUnlockMethodWith\(password, function\(tool, account\) \{\s*return Model\.unlockEnvelopeUpdateCommand/
       .test(bodyOf("addQuickUnlockMethod")),
   bodyOf("addQuickUnlockMethod"))
@@ -320,8 +385,8 @@ check("only a setting explicitly false counts as off, never one not loaded yet",
   /settings\[name\] === false/.test(bodyOf("quickUnlockSettingOff")), bodyOf("quickUnlockSettingOff"))
 check("a method just enabled is not taken for off while its setting write lands",
   /quickUnlockEnabledAt\[c\.method\]/.test(reconcile) && /quickUnlockEnableGraceMs/.test(reconcile)
-    && /noteQuickUnlockEnabled\("pin"\)/.test(bodyOf("submitPinSetup"))
-    && /noteQuickUnlockEnabled\("fingerprint"\)/.test(bodyOf("submitFingerprintSetup"))
+    && /noteQuickUnlockEnabled\("pin"\)/.test(bodyOf("savePinSetup"))
+    && /noteQuickUnlockEnabled\("fingerprint"\)/.test(bodyOf("saveFingerprintSetup"))
     && /noteQuickUnlockEnabled\("fido"\)/.test(fidoSrc),
   reconcile)
 check("a method that is off is purged even with no envelope entry for it, which clears its legacy entry",

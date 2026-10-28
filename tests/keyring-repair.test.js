@@ -112,6 +112,7 @@ printf 'opened'`, { mode: 0o755 })
     eq(tag + "the original is kept beside it", backups().length, 1)
     eq(tag + "byte for byte", backups().length && fs.readFileSync(path.join(dir, backups()[0]), "utf8"), broken)
     check(tag + "the repaired envelope is checked and opens", /opens with systemd-creds/.test(r.out), r.out)
+    check(tag + "the backup's retention is said out loud", /removed after \d+ days/.test(r.out), r.out)
     check(tag + "no secret is printed",
       !r.out.includes(sealed.slice(0, 40)) && !r.out.includes("their-secret") && !r.out.includes("single-line-session"),
       "the output holds a secret")
@@ -133,6 +134,23 @@ printf 'opened'`, { mode: 0o755 })
     check(tag + "--auto on a clean file says clean, and nothing else on stdout",
       r.code === 0 && r.last === "file=clean" && !/repair-keyring:/.test(r.all), r.all)
     for (const f of backups().slice(1)) fs.rmSync(path.join(dir, f))
+    eq(tag + "the backup is private whatever the keyring's mode was",
+      fs.statSync(path.join(dir, backups()[0])).mode & 0o777, 0o600)
+
+    // Retention: a backup is the whole keyring, so it does not stay for good.
+    // Only this file's own backups go; a neighbour's are not this script's.
+    const stale = path.join(dir, "Default_keyring.keyring.before-repair-20200101-000000")
+    const neighbour = path.join(dir, "Other.keyring.before-repair-20200101-000000")
+    const old = Date.now() / 1000 - 40 * 86400
+    for (const f of [stale, neighbour]) { fs.writeFileSync(f, broken, { mode: 0o600 }); fs.utimesSync(f, old, old) }
+    r = run("--check", file)
+    check(tag + "--check removes no backup", fs.existsSync(stale), "pruned by --check")
+    r = auto()
+    check(tag + "a start-up run removes a backup past its retention",
+      r.code === 0 && r.last === "file=clean" && !fs.existsSync(stale), r.all)
+    check(tag + "and keeps a recent one", backups().some(f => f !== path.basename(neighbour)), backups().join())
+    check(tag + "and leaves another file's backup alone", fs.existsSync(neighbour), "the neighbour went")
+    fs.rmSync(neighbour)
 
     r = run(file)
     eq(tag + "a second run has nothing to do", r.code, 0)

@@ -45,10 +45,21 @@ Column {
     Text {
       textFormat: Text.PlainText
       width: parent.width
-      text: "Your master password is already stored encrypted and sealed to this machine. A touch asks the key for a secret only it can produce, and enabling this lets that secret open the password, so unlocking needs the key itself."
+      text: "Your master password is already stored encrypted and sealed to this machine. A touch asks the key for a secret only it can produce, and enabling this lets that secret open the password, so unlocking needs the key itself. A registration that asks for the key's PIN keeps asking for it here, typed into pinentry, and the key then answers with a secret a touch alone never yields."
       color: panel.dim
       font.family: panel.fontFamily
       font.pixelSize: Style.font.bodySmall
+      wrapMode: Text.WordWrap
+    }
+
+    Text {
+      textFormat: Text.PlainText
+      visible: vault.fidoDowngradeWarning !== ""
+      width: parent.width
+      text: "󰀪  " + vault.fidoDowngradeWarning
+      color: Color.urgent
+      font.family: panel.fontFamily
+      font.pixelSize: Style.font.caption
       wrapMode: Text.WordWrap
     }
   }
@@ -106,8 +117,18 @@ Column {
       font.bold: true
     }
 
+    // Typed into pinentry when it is available (submitFidoSetup() in
+    // Service.qml): the field is drawn only when the vault says so.
+    PinentryHint {
+      panel: screen.panel
+      vault: screen.vault
+      what: "master password"
+      busy: screen.vault.fidoBusy
+    }
+
     LineField {
       id: masterField
+      visible: vault.typedSecretEntry === "field"
       width: parent.width
       placeholderText: "Needed once, to store for FIDO2 unlock..."
       password: true
@@ -134,13 +155,13 @@ Column {
       spacing: Style.space(8)
 
       Button {
-        text: vault.fidoBusy ? "Saving..." : "Enable"
-        iconText: vault.fidoBusy ? "󰑐" : "󰟵"
-        iconSpinning: vault.fidoBusy
+        text: vault.fidoBusy ? "Saving..." : (vault.typedSecretWaits ? "Waiting for the vault helper..." : "Enable")
+        iconText: vault.fidoBusy || vault.typedSecretWaits ? "󰑐" : "󰟵"
+        iconSpinning: vault.fidoBusy || vault.typedSecretWaits
         selected: true
         accent: Color.accent
         fontFamily: panel.fontFamily
-        enabled: !vault.fidoBusy
+        enabled: !vault.fidoBusy && !vault.typedSecretWaits
         onClicked: vault.submitFidoSetup()
       }
 

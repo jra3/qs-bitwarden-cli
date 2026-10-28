@@ -35,8 +35,10 @@ check("umask is set before the directory is created, not after",
   login.indexOf("umask 077") < login.indexOf("mkdir"), login)
 check("the read side exits quietly instead, since it runs on every refresh",
   read.includes('[ -n "$d" ] || exit 0') && !/XDG_RUNTIME_DIR:\?/.test(read), read)
-check("the read side never follows a symlinked directory or handoff file",
+check("the read side never follows a symlinked directory or handoff pipe",
   read.includes('[ ! -L "$d" ]') && read.includes('[ ! -L "$f" ]'), read)
+check("the read side removes a file at that path without reading it",
+  /\[ -p "\$f" \] && \[ ! -L "\$f" \] \|\| \{ rm -f -- "\$f"; exit 0; \}/.test(read), read)
 
 // Actually run the two scripts to prove the behaviour, with `bw` stubbed.
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "qsbw-handoff-"))
@@ -92,11 +94,23 @@ check("the handoff directory ends up private to the user",
   (fs.statSync(handoffDir).mode & 0o777) === 0o700,
   "0" + (fs.statSync(handoffDir).mode & 0o777).toString(8))
 
+const handoff = path.join(handoffDir, "session-handoff")
+check("what the terminal left is a pipe, not a file",
+  fs.existsSync(handoff) && fs.statSync(handoff).isFIFO(), "no pipe at the handoff path")
+check("and it is private", (fs.statSync(handoff).mode & 0o777) === 0o600,
+  "0" + (fs.statSync(handoff).mode & 0o777).toString(8))
 const roundTrip = runInner(read, withRuntime)
 check("the panel reads the key back", roundTrip.out === "STUBSESSIONKEY", JSON.stringify(roundTrip))
 const secondRead = runInner(read, withRuntime)
 check("and the key is consumed, so a second read gets nothing",
   secondRead.out === "", JSON.stringify(secondRead))
+check("and no pipe is left", !fs.existsSync(handoff), "pipe still present")
+
+// A file at that path (left by an older version, or planted) is never read.
+fs.writeFileSync(handoff, "PLANTEDKEYPLANTEDKEYPLANTEDKEYPLANTEDKEY==")
+const planted = runInner(read, withRuntime)
+check("a regular file at the handoff path is removed unread",
+  planted.out === "" && !fs.existsSync(handoff), JSON.stringify(planted))
 
 fs.rmSync(tmp, { recursive: true, force: true })
 

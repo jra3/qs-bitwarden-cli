@@ -158,9 +158,16 @@ case "$cmd" in
   lookup) [ -f "$f" ] || exit 1; cat "$f"; echo ;;
   store) cat > "$f.tmp" && mv "$f.tmp" "$f" ;;
   clear) rm -f "$f" ;;
-  search) [ -f "$f" ] && cat "$f"; exit 0 ;;
+  # As the real tool prints an item: its bus path first, then the attributes
+  # and the secret. The session store checks that path, so a stub that printed
+  # only the value read as "could not see the item" and the store was undone.
+  search) [ -f "$f" ] && printf '[/org/freedesktop/secrets/collection/session/1]\nlabel = stub\nsecret = %s\n' "$(cat "$f")"; exit 0 ;;
   *) exit 2 ;;
 esac`)
+  // SearchItems, as the secret service answers it: the item's path only.
+  write("busctl", `
+account=""; while [ $# -gt 0 ]; do case "$1" in account) account="$2"; shift 2;; *) shift;; esac; done
+if [ -f "$STORE_DIR/$account" ]; then echo 'aoao 1 "/org/freedesktop/secrets/collection/session/1" 0'; else echo 'aoao 0 0'; fi`)
   write("systemd-creds", `
 mode=""; name=""
 for a in "$@"; do case "$a" in encrypt|decrypt) mode="$a";; --name=*) name="\${a#--name=}";; esac; done
@@ -238,6 +245,18 @@ exit 0`)
   check("and is gone from B", inspect(SLOT_B).fingerprint === false, JSON.stringify(inspect(SLOT_B)))
   eq("a FIDO2 purge with no key wraps succeeds", purge("fido").code, 0)
   check("an unknown method is refused", Model.quickUnlockPurgeCommand(tool, [SLOT_A], "password")[2] === "exit 2", "")
+  // With no method left, or storeMasterPassword off, every account's envelope
+  // goes, not only the one on screen.
+  const keep = entries().filter(e => e.indexOf("unlock_envelope") === 0)
+  const saved = keep.map(e => [e, fs.readFileSync(path.join(store, e))])
+  eq("clearing the stored passwords covers every account", run(Model.unlockEnvelopeClearCommand([SLOT_A, SLOT_B, SLOT_C, "not a slot"])).code, 0)
+  check("neither envelope is left", entries().every(e => e.indexOf("unlock_envelope") !== 0), entries().join(","))
+  eq("a clear with nothing left to remove succeeds", run(Model.unlockEnvelopeClearCommand([SLOT_A, SLOT_B])).code, 0)
+  fs.writeFileSync(path.join(bin, "secret-tool-real"), fs.readFileSync(path.join(bin, "secret-tool")), { mode: 0o755 })
+  write("secret-tool", `[ "$1" = clear ] && { echo 'synthetic service unavailable' >&2; exit 1; }; exec "$(dirname "$0")/secret-tool-real" "$@"`)
+  eq("a clear the keyring refuses fails", run(Model.unlockEnvelopeClearCommand([SLOT_A])).code, 1)
+  fs.renameSync(path.join(bin, "secret-tool-real"), path.join(bin, "secret-tool"))
+  for (const [e, body] of saved) fs.writeFileSync(path.join(store, e), body)
   // Put A's PIN back for the checks below.
   eq("A's PIN is set again", runAs(A, Model.unlockEnvelopeUpdateCommand(tool, A, { kind: "add-pin" }), { [SECRET]: PW_A, [PIN]: "111111" }).code, 0)
 

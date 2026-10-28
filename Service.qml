@@ -568,11 +568,11 @@ Item {
       verifyWithBw(pw, function(ok) { done(ok) })
       return
     }
-    var env = {}
-    env[Model.keyringSecretEnvVar()] = pw
+    var secrets = {}
+    secrets[Model.keyringSecretEnvVar()] = pw
     queueEnvelopeJob({
       command: Model.unlockEnvelopeCheckCommand(envelopeTool(), envelopeAccount()),
-      env: env,
+      secrets: secrets,
       onDone: function(code) {
         if (code === 0) { done(true); return }
         root.verifyWithBw(pw, function(ok) { done(ok) })
@@ -852,6 +852,13 @@ Item {
   property int associationsReadEpoch: -1
   property bool sessionStorePending: false
   property bool sessionClearPending: false
+  // The session key is in the keyring's memory-only collection, checked
+  // there after the store: only then will a shell restart reopen the vault,
+  // so only then may an unload leave the session valid in bw.
+  property bool sessionRemembered: false
+  // Why the last store did not remember the session, for the settings row;
+  // "" once one has.
+  property string rememberSessionProblem: ""
   // Which account's session the running store writes, and the accounts
   // whose session clears wait behind a running one: a switch can land
   // between a request and its run.
@@ -933,7 +940,7 @@ Item {
 
   function inspectSshAgentHelper() {
     if (sshAgentHelperProc.running) return
-    sshAgentHelperProc.command = Model.sshAgentHelperInspectCommand(root.sshAgentPluginDir)
+    sshAgentHelperProc.command = Model.sshAgentHelperInspectCommand(root.sshAgentPluginDir, root.allowDevelopmentHelpers)
     sshAgentHelperProc.running = true
   }
 
@@ -949,7 +956,7 @@ Item {
 
   function inspectUnlockKey() {
     if (unlockKeyProc.running || sshAgentPluginDir === "") return
-    unlockKeyProc.command = Model.unlockKeyInspectCommand(root.sshAgentPluginDir)
+    unlockKeyProc.command = Model.unlockKeyInspectCommand(root.sshAgentPluginDir, root.allowDevelopmentHelpers)
     unlockKeyProc.running = true
   }
 
@@ -997,6 +1004,10 @@ Item {
   property var vaultLocalSecrets: ({})
   // Only in shell.json, never in the settings screen, and only `true` counts.
   readonly property bool allowVaultWithoutHelper: setting("allowVaultWithoutHelper", false) === true
+  // Likewise: lets a source checkout run its own `target/debug` helpers when
+  // the shipped ones are absent or fail their check. Off, a helper without a
+  // matching SHA256SUMS line is never run (Model.helperInspectCommand()).
+  readonly property bool allowDevelopmentHelpers: setting("allowDevelopmentHelpers", false) === true
 
   function inspectVaultHelper() {
     if (vaultHelperInspectProc.running) return
@@ -1006,7 +1017,7 @@ Item {
       useVaultFallback("the plugin's directory is not known, so the vault helper cannot be found.")
       return
     }
-    vaultHelperInspectProc.command = Model.vaultHelperInspectCommand(root.sshAgentPluginDir)
+    vaultHelperInspectProc.command = Model.vaultHelperInspectCommand(root.sshAgentPluginDir, root.allowDevelopmentHelpers)
     vaultHelperInspectProc.running = true
   }
 
@@ -1201,13 +1212,22 @@ Item {
       if (held) inject[key] = "secret:" + held
       else environment[key] = proc.environment[key]
     }
+    // The same split for what goes to stdin instead of the environment.
+    var secrets = proc.secrets === null || proc.secrets === undefined ? null : {}
+    var heldSecrets = {}
+    for (var name in proc.secrets || {}) {
+      var heldSecret = Model.heldSecretName(proc.secrets[name])
+      if (heldSecret) heldSecrets[name] = "secret:" + heldSecret
+      else secrets[name] = proc.secrets[name]
+    }
     if (!vaultHelperActive) {
       // What was typed into pinentry would come back to the shell: not run.
       if (proc.capture.indexOf("pinentry:") === 0) {
         Qt.callLater(function() { proc.finish(Model.pinentryExitCodes().missing, "", "no vault helper", false, false) })
         return
       }
-      proc.runLocally(vaultLocalEnv(environment, inject))
+      var input = secrets === null ? "" : Model.secretBlock(vaultLocalEnv(secrets, heldSecrets))
+      proc.runLocally(vaultLocalEnv(environment, inject), input + proc.stdinText)
       return
     }
     vaultRunSeq += 1
@@ -1216,11 +1236,13 @@ Item {
     runs[id] = proc
     vaultRuns = runs
     proc.runId = id
-    vaultHelperProc.write(Model.vaultExecLine(id, proc.command, environment, inject, proc.capture, proc.stdinText))
+    vaultHelperProc.write(Model.vaultExecLine(id, proc.command, environment, inject, proc.capture, proc.stdinText,
+      secrets, heldSecrets))
     proc.started()
   }
 
-  // The environment a fallback run gets: held values resolved here.
+  // The environment a fallback run gets (and the values of its secrets
+  // block): held values resolved here.
   function vaultLocalEnv(environment, inject) {
     var env = Object.assign({}, environment || {})
     for (var name in inject) {
@@ -1345,10 +1367,48 @@ Item {
 
   // Besides the tool: argon2 and systemd-creds --user.
   property var quickUnlockPrereqs: ({ argon2: false, creds: false, ready: false, message: "", checked: false })
-  readonly property bool quickUnlockAvailable: unlockKeyReady && quickUnlockPrereqs.ready
-  readonly property string quickUnlockUnavailableReason: !unlockKeyReady
-    ? String(unlockKeyHelper.message || "")
-    : String(quickUnlockPrereqs.message || "")
+  // `storeMasterPassword: false` in shell.json (not in the settings screen;
+  // only an explicit false counts) means the master password is never
+  // written to the keyring, encrypted or not, so quick unlock is off and an
+  // envelope found at start is removed. For whoever would rather type the
+  // password than have an offline guessing target in the keyring.
+  readonly property bool storeMasterPassword: setting("storeMasterPassword", true) !== false
+  readonly property bool quickUnlockAvailable: unlockKeyReady && quickUnlockPrereqs.ready && storeMasterPassword
+  readonly property string quickUnlockUnavailableReason: !storeMasterPassword
+    ? Model.storeMasterPasswordOffReason()
+    : (!unlockKeyReady ? String(unlockKeyHelper.message || "") : String(quickUnlockPrereqs.message || ""))
+
+  // Whether any quick-unlock method is turned on: the only reason to keep
+  // the master password in the keyring at all.
+  function quickUnlockWanted() {
+    return fingerprintUnlock || fidoUnlock || pinUnlock
+  }
+
+  // Adding a weaker way in beside a stronger one lowers the stored
+  // password to the weaker: with a fingerprint wrap, a program running as
+  // you opens it with no finger; with a PIN wrap, after an offline search.
+  // A FIDO2 wrap beside either adds nothing. The enable forms show this and
+  // ask for a second press, so it is a decision rather than an accident.
+  function quickUnlockDowngradeWarning(method) {
+    var summary = envelopeSummary
+    var hasFido = Boolean(summary && Array.isArray(summary.fido) && summary.fido.length > 0)
+      || (fidoUnlock && fidoStored)
+    var hasFingerprint = Boolean(summary && summary.fingerprint) || fingerprintStored
+    var hasPin = Boolean(summary && summary.pin) || pinConfigured
+    if (method === "fingerprint" && hasFido) {
+      return "FIDO2 unlock is on. A fingerprint releases no secret, so with this on a program running as you "
+        + "can open the stored password without the key or your finger: the key would no longer protect it."
+    }
+    if (method === "pin" && hasFido) {
+      return "FIDO2 unlock is on. A PIN can be guessed offline by a program running as you (see the PIN limit "
+        + "above), so with this on the key would no longer be what protects the stored password."
+    }
+    if (method === "fido" && (hasFingerprint || hasPin)) {
+      return (hasFingerprint ? "Fingerprint" : "PIN") + " unlock is on, and a program running as you can open "
+        + "the stored password that way, so the key adds no protection until it is turned off."
+    }
+    return ""
+  }
 
   // Which account an envelope belongs to, from `bw status`.
   property string accountId: ""
@@ -1567,8 +1627,12 @@ Item {
     }
   }
 
-  // Queue one envelope process: { command, env, secretOutput, writes,
-  // onDone(exitCode, stdout) }. `env` holds secrets and is dropped on start.
+  // Queue one envelope process: { command, env, secrets, secretOutput,
+  // writes, onDone(exitCode, stdout) }. `secrets` (the typed password, a PIN,
+  // the key's PIN, by value or held reference) go to the run's stdin, never
+  // its environment, and are dropped on start; `env` is the plain
+  // environment a `bw` job needs. Every job gets a secrets block, so a
+  // script's reader never waits on an empty stdin.
   function queueEnvelopeJob(job) {
     // Answers for an account no longer active are dropped (onEnvelopeJobExited()).
     job.slot = activeSlot
@@ -1592,8 +1656,7 @@ Item {
       return
     }
     if (job.unlock && (job.cancelled || job.slot !== activeSlot || job.epoch !== vaultEpoch || logoutPending)) {
-      for (var key in job.env) forgetHeldPassword(job.env[key])
-      job.env = null
+      forgetJobSecrets(job)
       if (job.unlock && job.onDropped) job.onDropped(job.cancelled === true)
       pumpEnvelopeJobs()
       return
@@ -1608,8 +1671,18 @@ Item {
     envelopeProc.capture = job.holdOutput ? "secret:" + job.heldName : (job.capture || "plain")
     envelopeProc.inject = job.inject || ({})
     envelopeProc.environment = Object.assign({}, job.accountEnv || {}, job.env || {})
+    envelopeProc.secrets = job.secrets || {}
     job.env = null
+    job.secrets = null
     envelopeProc.running = true
+  }
+
+  // A job that will not run: the held values it carried go with it.
+  function forgetJobSecrets(job) {
+    for (var key in job.secrets) forgetHeldPassword(job.secrets[key])
+    for (var name in job.env) forgetHeldPassword(job.env[name])
+    job.secrets = null
+    job.env = null
   }
 
   function onEnvelopeJobExited(exitCode) {
@@ -1622,6 +1695,7 @@ Item {
     if (job && job.holdOutput) out = envelopeProc.outputHeld ? Model.heldSecretRef(job.heldName) : ""
     envelopeJob = null
     envelopeProc.environment = {}
+    envelopeProc.secrets = {}
     // The output was the master password: scrub the collector.
     if (job && job.secretOutput) clearProcessCollectorSoon(envelopeProc)
     var accepting = job && !logoutPending && job.slot === activeSlot
@@ -1643,8 +1717,7 @@ Item {
   function cancelEnvelopeUnlockJobs() {
     envelopeJobs = envelopeJobs.filter(function(job) {
       if (!job.unlock) return true
-      for (var key in job.env) root.forgetHeldPassword(job.env[key])
-      job.env = null
+      root.forgetJobSecrets(job)
       return false
     })
     if (envelopeJob && envelopeJob.unlock) {
@@ -1655,6 +1728,7 @@ Item {
         vaultKill(envelopeProc)
         envelopeJob = null
         envelopeProc.environment = {}
+        envelopeProc.secrets = {}
         Qt.callLater(pumpEnvelopeJobs)
       }
     }
@@ -1672,8 +1746,7 @@ Item {
     envelopeJobs = []
     for (var i = 0; i < discarded.length; i++) {
       var job = discarded[i]
-      for (var key in job.env) forgetHeldPassword(job.env[key])
-      job.env = null
+      forgetJobSecrets(job)
       if (job.onCancelled) job.onCancelled()
     }
     // An in-flight writer still finishes before another write can start;
@@ -1728,6 +1801,10 @@ Item {
   }
 
   function refreshEnvelope() {
+    if (!storeMasterPassword) {
+      purgeUnwantedEnvelope()
+      return
+    }
     if (!quickUnlockAvailable) return
     queueEnvelopeJob({
       command: Model.unlockEnvelopeInspectCommand(envelopeTool(), activeSlot),
@@ -1742,6 +1819,11 @@ Item {
         if ((code === 0 && root.envelopeSummary) || code === Model.envelopeExitCodes().absent) {
           root.reconcileDisabledMethods()
         }
+        // A purge that failed for another account is retried even once this
+        // one's envelope is gone.
+        if (((code === 0 && root.envelopeSummary)
+             || (code === Model.envelopeExitCodes().absent && root.envelopePurgeFailed))
+            && root.reconcileMasterOnlyEnvelope()) return
         root.recomputeFingerprintStored()
         root.recomputePinConfigured()
         // A switched-to account's methods are known only now.
@@ -1750,6 +1832,49 @@ Item {
           if (root.sshAuthSurfaceActive && root.status === "locked" && !root.isUnlocking
               && !root.fingerprintScanning && !root.fidoScanning) root.armPresenceUnlock()
         }
+      }
+    })
+  }
+
+  // An envelope nothing can open but the password itself, with no method
+  // turned on, is only an offline guessing target: removed. Not while a
+  // write is queued or a method was just enabled, when the way in may be on
+  // its way (an enable form creates the envelope first, then adds to it).
+  // Returns whether a removal was queued (the summary is then stale).
+  function reconcileMasterOnlyEnvelope() {
+    if (envelopeHasMethods() || quickUnlockWanted() || envelopeJobs.length > 0 || !accountId) return false
+    var methods = ["pin", "fingerprint", "fido"]
+    for (var i = 0; i < methods.length; i++) {
+      if (Date.now() - Number(quickUnlockEnabledAt[methods[i]] || 0) < quickUnlockEnableGraceMs) return false
+    }
+    console.log("qs-bitwarden envelope: no quick-unlock method is on; removing the stored master password")
+    purgeUnwantedEnvelope()
+    return true
+  }
+
+  // Removes every account's envelope from the keyring, whatever it holds;
+  // the summary follows once that worked. `storeMasterPassword` off, or no
+  // method left to use it (reconcileMasterOnlyEnvelope()): both settings are
+  // shared, so no account should keep one.
+  property bool envelopePurgeFailed: false
+
+  function purgeUnwantedEnvelope() {
+    queueEnvelopeJob({
+      command: Model.unlockEnvelopeClearCommand(accountSlotsForPurge()), writes: true,
+      onDone: function(code) {
+        root.envelopePurgeFailed = code !== 0
+        if (code === 0) {
+          root.envelopeSummary = null
+          if (root.errorMessage.indexOf("Could not remove the stored master password") === 0) root.errorMessage = ""
+        } else {
+          root.errorMessage = "Could not remove the stored master password from the OS keyring. Check the keyring service; the next check retries."
+          console.warn("qs-bitwarden envelope: removing the stored master password failed (" + code + ")")
+        }
+        root.envelopeChecked = true
+        root.recomputeFingerprintStored()
+        root.recomputePinConfigured()
+        // Nothing is left to arm, but the switched-to account's turn is over.
+        root.armAfterEnvelope = false
       }
     })
   }
@@ -1785,8 +1910,10 @@ Item {
 
   // The only writer of the stored password: called when `bw` just accepted a
   // typed password (login, unlock, or an enable form's check), never with one
-  // a quick-unlock method produced. `done(ok)` is optional.
-  function storeAcceptedMasterPassword(password, done) {
+  // a quick-unlock method produced. `done(ok)` is optional. `forMethod`: an
+  // enable form is about to add a way in, so an envelope may be created
+  // even while no method's setting is on yet.
+  function storeAcceptedMasterPassword(password, done, forMethod) {
     var pw = String(password || "")
     var oldPassword = ""
     // The old password of a refused quick unlock is held by reference; its
@@ -1802,17 +1929,22 @@ Item {
       var E = Model.envelopeExitCodes()
       var tool = root.envelopeTool()
       var account = root.envelopeAccount()
-      var env = {}
-      env[Model.keyringSecretEnvVar()] = pw
+      var secrets = {}
+      secrets[Model.keyringSecretEnvVar()] = pw
       root.queueEnvelopeJob({
         command: Model.unlockEnvelopeOpenCommand(tool, account, { kind: "master" }),
-        env: env, secretOutput: true, holdOutput: true,
+        secrets: secrets, secretOutput: true, holdOutput: true,
         onDone: function(code, out) {
           // Only whether it opens matters; the copy it printed is not kept.
           if (Model.heldSecretName(out)) root.forgetVaultSecret(Model.heldSecretName(out))
           if (code === 0) { finish(true); return }
           if (code === E.absent || code === 6 || code === E.unseal) {
-            root.writeEnvelope(Model.unlockEnvelopeCreateCommand(tool, account), env, finish)
+            // No envelope: one is created only for a quick-unlock method
+            // about to use it. Nothing else needs the password stored, and
+            // a copy nobody can open without the password is still an
+            // offline guessing target.
+            if (!forMethod && !root.quickUnlockWanted()) { finish(false); return }
+            root.writeEnvelope(Model.unlockEnvelopeCreateCommand(tool, account), secrets, finish)
             return
           }
           if (code === 3) {
@@ -1828,8 +1960,10 @@ Item {
               root.writeEnvelope(Model.unlockEnvelopeUpdateCommand(tool, account,
                 { kind: "rotate", auth: { kind: "fingerprint" } }), rotate, finish)
             } else if (!root.envelopeHasMethods()) {
-              // No methods to keep: this password becomes the envelope.
-              root.writeEnvelope(Model.unlockEnvelopeCreateCommand(tool, account), env, finish)
+              // No methods to keep: this password becomes the envelope, if
+              // anything is going to use one.
+              if (!forMethod && !root.quickUnlockWanted()) { finish(false); return }
+              root.writeEnvelope(Model.unlockEnvelopeCreateCommand(tool, account), secrets, finish)
             } else {
               // Nothing reaches the data key yet; the next quick unlock will
               // produce the old password and come back here.
@@ -1853,9 +1987,9 @@ Item {
       || (Array.isArray(envelopeSummary.fido) && envelopeSummary.fido.length > 0))
   }
 
-  function writeEnvelope(command, env, done, quiet) {
+  function writeEnvelope(command, secrets, done, quiet) {
     queueEnvelopeJob({
-      command: command, env: env, writes: true,
+      command: command, secrets: secrets, writes: true,
       onDone: function(code) {
         if (code !== 0 && (!quiet || quiet.indexOf(code) === -1)) {
           console.log("qs-bitwarden envelope: write failed with " + code)
@@ -1870,24 +2004,25 @@ Item {
   // anew; `op` (the add) is authorized by it opening the master wrap. With no
   // envelope, `bw` checks it, it is stored as an accepted password, then the
   // method is added.
-  function addQuickUnlockMethod(password, op, extraEnv, done) {
+  function addQuickUnlockMethod(password, op, extraSecrets, done) {
     addQuickUnlockMethodWith(password, function(tool, account) {
       return Model.unlockEnvelopeUpdateCommand(tool, account, op)
-    }, extraEnv, done)
+    }, extraSecrets, done)
   }
 
   // The same, for a method whose command is more than an update (FIDO2
-  // touches the key first). `done(ok, why, exitCode)`.
-  function addQuickUnlockMethodWith(password, makeCommand, extraEnv, done) {
+  // touches the key first). `extraSecrets`: more stdin records (a new PIN,
+  // the key's PIN). `done(ok, why, exitCode)`.
+  function addQuickUnlockMethodWith(password, makeCommand, extraSecrets, done) {
     var pw = String(password || "")
     if (!quickUnlockAvailable) { done(false, "unavailable", 0); return }
     withEnvelopeAccount(function() {
-      var env = {}
-      env[Model.keyringSecretEnvVar()] = pw
-      if (extraEnv) for (var k in extraEnv) env[k] = extraEnv[k]
+      var secrets = {}
+      secrets[Model.keyringSecretEnvVar()] = pw
+      if (extraSecrets) for (var k in extraSecrets) secrets[k] = extraSecrets[k]
       var command = makeCommand(root.envelopeTool(), root.envelopeAccount())
       root.queueEnvelopeJob({
-        command: command, env: env, writes: true,
+        command: command, secrets: secrets, writes: true,
         onDone: function(code) {
           var E = Model.envelopeExitCodes()
           if (code === 0) { root.refreshEnvelope(); done(true, "", 0); return }
@@ -1903,11 +2038,11 @@ Item {
               if (!stored) { done(false, "failed", 0); return }
               var again = {}
               again[Model.keyringSecretEnvVar()] = pw
-              if (extraEnv) for (var k2 in extraEnv) again[k2] = extraEnv[k2]
+              if (extraSecrets) for (var k2 in extraSecrets) again[k2] = extraSecrets[k2]
               root.writeEnvelope(command, again, function(added, addCode) {
                 done(added, added ? "" : "failed", added ? 0 : addCode)
               })
-            })
+            }, true)
           })
         }
       })
@@ -1917,12 +2052,12 @@ Item {
   // No envelope: `bw` checks the password. The session key it mints replaces
   // the current one and is adopted like an unlock's.
   function verifyWithBw(password, done) {
-    var env = {}
-    env[Model.keyringSecretEnvVar()] = String(password || "")
+    var secrets = {}
+    secrets[Model.keyringSecretEnvVar()] = String(password || "")
     beginEpochOperation("bwVerify")
     queueEnvelopeJob({
       command: Model.bwVerifyPasswordCommand(),
-      env: bwEnv(env), secretOutput: true, capture: "session",
+      env: bwEnv(), secrets: secrets, secretOutput: true, capture: "session",
       onDone: function(code, out) {
         var s = code === 0 ? Model.extractSessionToken(out) : ""
         // Locked or logged out meanwhile: adopting the new session would
@@ -1972,13 +2107,13 @@ Item {
       return
     }
     withEnvelopeAccount(function() {
-      var env = {}
-      env[Model.keyringSecretEnvVar()] = password
-      env[Model.pinEnvVar()] = pin
+      var secrets = {}
+      secrets[Model.keyringSecretEnvVar()] = password
+      secrets[Model.pinEnvVar()] = pin
       var codes = Model.legacyMigrationExitCodes()
       root.queueEnvelopeJob({
         command: Model.legacyPinMigrationCommand(root.envelopeTool(), root.envelopeAccount()),
-        env: env, writes: true,
+        secrets: secrets, writes: true,
         onDone: function(code) {
           root.forgetHeldPassword(password)
           root.forgetHeldPassword(pin)
@@ -2424,7 +2559,11 @@ Item {
   // With the session not remembered, nothing will reopen it, so an unload
   // while unlocked (a shell restart, the plugin removed) must not leave it
   // valid in bw's data: lock it. Detached, since this shell is going away.
-  // With it remembered, keeping it is the point of the setting.
+  // With it remembered, keeping it is the point of the setting -- but only
+  // when the keyring copy is known to be there (sessionRemembered): with the
+  // setting on and the store refused, the key would otherwise stay valid in
+  // bw with no copy anywhere to reopen the panel. Shutdown and reboot are
+  // not unloads (the shell is killed); the logind monitor locks for those.
   // The shell is unloading: the helper's exit is expected, and it stops (its
   // runs killed, its memory wiped) rather than waiting for its stdin to close.
   function releaseVaultHelper() {
@@ -2433,7 +2572,7 @@ Item {
   }
 
   function lockSessionOnUnload() {
-    if (!session || rememberSession) return
+    if (!session || (rememberSession && sessionRemembered)) return
     if (vaultHelperActive) {
       // The helper holds the key: it starts the lock, detached, before it goes.
       var inject = {}
@@ -3520,6 +3659,9 @@ Item {
       // has reads to invalidate.
       if (session && session !== token) vaultEpoch += 1
       session = token
+      // Read back from the keyring, so a copy is there: an unload may leave
+      // the session to it again.
+      sessionRemembered = true
     }
     runStatusCheck()
     // A remembered session is usually still good, so read the list alongside
@@ -3742,7 +3884,7 @@ Item {
       Qt.callLater(function() { presenter.focusField("deviceCode") })
       return
     }
-    if (!String(loginPassword || "")) {
+    if (!loginSecret()) {
       errorMessage = "Your master password is needed again for this step."
       resetEmailLoginSecondFactor()
       Qt.callLater(function() { presenter.focusField("loginPass") })
@@ -3772,15 +3914,15 @@ Item {
       String(loginEmail || "").trim(), resolvedLoginServerUrl(), login2faMethod)
     loginProc.running = true
     loginSubmitted = true
-    writeAuthPassword("login", loginPassword)
+    writeAuthPassword("login", loginSecret())
   }
 
   // A login waiting on an emailed challenge survives a close, within its
-  // window and while the password is still held.
+  // window and while the password is still held (typed, or by the helper).
   function pendingSecondFactorLogin() {
     if (status !== "unauthenticated" || loginMethod !== "email") return false
     if (!show2faField && !showDeviceCodeField && !show2faMethodPicker) return false
-    if (!String(loginPassword || "")) return false
+    if (!loginSecret()) return false
     return Model.secondFactorWindowOpen(secondFactorStartedAt, Date.now())
   }
 
@@ -3832,6 +3974,7 @@ Item {
     if (logoutCleanupFailed) return "Retry Logout Cleanup"
     if (logoutPending) return "Finishing logout..."
     if (isLoading) return show2faField ? "Verifying..." : "Logging in..."
+    if (typedSecretWaits && !loginSecret()) return "Waiting for the vault helper..."
     return show2faField ? "Verify & Unlock" : "Log In & Unlock"
   }
 
@@ -3885,6 +4028,7 @@ Item {
 
   // Login credentials and challenge state, back to the first stage.
   function clearLoginAttempt() {
+    forgetLoginMaster()
     loginPassword = ""
     loginClientId = ""
     loginClientSecret = ""
@@ -3983,13 +4127,17 @@ Item {
 
     if (loginMethod === "email") {
       var email = String(loginEmail || "").trim()
-      var pass = String(loginPassword === undefined || loginPassword === null ? "" : loginPassword)
+      var pass = loginSecret()
       if (!email) {
         errorMessage = "Email address is required"
         return
       }
       if (!pass) {
-        errorMessage = "Master password is required"
+        if (pinentryAvailable) {
+          submitLoginWithPinentry()
+          return
+        }
+        errorMessage = typedSecretWaits ? "Waiting for the vault helper. Try again in a moment." : "Master password is required"
         return
       }
       if (show2faMethodPicker) {
@@ -4024,7 +4172,7 @@ Item {
     } else {
       var id = String(loginClientId || "").trim()
       var secret = String(loginClientSecret || "").trim()
-      var pass2 = String(loginPassword === undefined || loginPassword === null ? "" : loginPassword)
+      var pass2 = loginSecret()
 
       if (!id) {
         errorMessage = "API Client ID is required"
@@ -4035,7 +4183,11 @@ Item {
         return
       }
       if (!pass2) {
-        errorMessage = "Master password is required to unlock vault"
+        if (pinentryAvailable) {
+          submitLoginWithPinentry()
+          return
+        }
+        errorMessage = typedSecretWaits ? "Waiting for the vault helper. Try again in a moment." : "Master password is required to unlock vault"
         return
       }
 
@@ -4079,6 +4231,7 @@ Item {
       // terminal can give.
       if (exitCode === 124 || Model.loginPromptRanOutOfInput(out, err)) {
         showDeviceCodeField = false
+        forgetLoginMaster()
         logLogin("device-unanswerable", out, err, exitCode)
         errorMessage = "This login asked for something the panel could not answer. "
           + "Finish it in a terminal instead."
@@ -4104,6 +4257,7 @@ Item {
       authPasswordWriteValue = ""
       if (authPasswordWriterProc.running) authPasswordWriterProc.running = false
       login2faCode = ""
+      forgetLoginMaster()
       syncLoginFieldsToState()
       logLogin("code-channel-missing", out, err, exitCode)
       errorMessage = "This Bitwarden CLI cannot take the two-step code privately "
@@ -4128,6 +4282,7 @@ Item {
     // The account's two-step methods are all ones the CLI cannot do.
     if (Model.loginHasNoUsableProvider(out, err)) {
       resetEmailLoginSecondFactor()
+      forgetLoginMaster()
       logLogin("no-usable-provider", out, err, exitCode)
       errorMessage = "This account's two-step method is one the Bitwarden CLI cannot use, "
         + "such as a passkey or Duo. Log in with an API key instead."
@@ -4192,9 +4347,12 @@ Item {
     if (exitCode === 0 && out.length > 10) {
       rememberTwoFactorMethod(login2faMethod)
       // Typed and accepted by `bw`: the stored password for a fresh login
-      // (storeAcceptedMasterPassword()).
-      pendingUnlockPassword = String(loginPassword || "")
+      // (storeAcceptedMasterPassword()). One pinentry took is the helper's
+      // under loginMasterName; the reference passes to the unlock, which
+      // forgets it once the stored copy is dealt with.
+      pendingUnlockPassword = loginSecret()
       pendingUnlockFrom = ""
+      loginMasterName = ""
       loginPassword = ""
       login2faCode = ""
       logLogin("success", out, err, exitCode)
@@ -4202,6 +4360,9 @@ Item {
       return
     }
 
+    // Refused, or nothing came of it: a password pinentry took is forgotten,
+    // and the next attempt asks for it again (as a refused unlock does).
+    forgetLoginMaster()
     if (err) {
       logLogin("bw-error", out, err, exitCode)
       errorMessage = Model.sanitizeInteractiveStderr(err, "") || "Login failed. Please check your credentials."
@@ -4334,9 +4495,33 @@ Item {
       return
     }
     sessionStorePending = false
-    if (exitCode !== 0) {
-      console.warn("qs-bitwarden-cli: could not store session in keyring (exit " + exitCode + ")")
+    if (exitCode === 0) {
+      sessionRemembered = true
+      rememberSessionProblem = ""
+      return
     }
+    // The store does not fall back to a disk-backed collection, and removes
+    // an item that landed in one (keyringStoreCommand() in BitwardenModel.js),
+    // so a failure means the session is not remembered: a shell restart
+    // asks for the password again, and an unload locks (lockSessionOnUnload()).
+    sessionRemembered = false
+    rememberSessionProblem = sessionStoreProblemText(exitCode)
+    console.warn("qs-bitwarden-cli: the session was not remembered (exit " + exitCode + "): "
+      + rememberSessionProblem)
+    errorMessage = "Session not remembered: " + rememberSessionProblem
+      + " You stay unlocked until a lock or a shell restart."
+  }
+
+  function sessionStoreProblemText(exitCode) {
+    if (exitCode === Model.keyringStoreMisplacedCode()) {
+      return "The OS keyring put the session key outside its memory-only session collection "
+        + "(on disk, possibly), so the key was removed from it again."
+    }
+    if (exitCode === Model.keyringStoreUnverifiedCode()) {
+      return "The OS keyring accepted the session key but could not show where it put it, "
+        + "so the key was removed from it again."
+    }
+    return "The OS keyring has no memory-only session collection, or is not running."
   }
 
   // Runs the next clear or store that waited behind the keyring processes.
@@ -4362,6 +4547,8 @@ Item {
       return
     }
     sessionClearPending = false
+    // Whatever the clear finds, the copy is no longer counted on.
+    if (target === activeSlot) sessionRemembered = false
     sessionClearRun = { slot: target, attempt: attempt || 1 }
     keyringClearProc.command = Model.keyringClearCommand(target)
     keyringClearProc.running = true
@@ -4380,7 +4567,14 @@ Item {
       return
     }
     sessionClearRun = null
-    if (run && exitCode !== 0) {
+    if (run && exitCode === Model.keyringClearUnknownCode()) {
+      // The search failed (secret service down), so nothing is known: the
+      // entry may still be there once the service is back.
+      console.warn("qs-bitwarden-cli: the OS keyring could not be checked after clearing the remembered session (exit "
+        + exitCode + ")")
+      errorMessage = "Could not check that the remembered session left the OS keyring (the keyring did not answer). "
+        + "Lock again to retry; after a reboot it is refused either way."
+    } else if (run && exitCode !== 0) {
       console.warn("qs-bitwarden-cli: the remembered session is still in the keyring after two clears (exit "
         + exitCode + ")")
       errorMessage = "Could not remove the remembered session from the OS keyring. "
@@ -4509,7 +4703,7 @@ Item {
     if (loginMethod === "apikey") {
       // A live Process binding: only carry the API fields once a login starts.
       if (!loginSubmitted) return authEnv("", "", "", "")
-      return authEnv(loginPassword,
+      return authEnv(loginSecret(),
                      String(loginClientId || "").trim(),
                      String(loginClientSecret || "").trim(),
                      String(login2faCode || "").trim())
@@ -4543,16 +4737,12 @@ Item {
     return bwEnv(e)
   }
 
-  function pinEnv(pin) {
-    var env = {}
-    env[Model.pinEnvVar()] = String(pin || "")
-    return env
-  }
-
-  function secretEnv(value) {
-    var env = {}
-    env[Model.keyringSecretEnvVar()] = String(value || "")
-    return env
+  // A VaultProcess `secrets` map carrying the PIN (a value, or a held
+  // reference) to a run's stdin.
+  function pinSecrets(pin) {
+    var secrets = {}
+    secrets[Model.pinEnvVar()] = String(pin || "")
+    return secrets
   }
 
   // -------------------------------------------------------------------------
@@ -4963,12 +5153,21 @@ Item {
     keyringHasMasterProc.running = true
   }
 
+  // The second press an enable form asks for when it would lower the
+  // stored password to a weaker method (quickUnlockDowngradeWarning()).
+  property bool pinDowngradeConfirmed: false
+  property bool fpDowngradeConfirmed: false
+  readonly property string pinDowngradeWarning: quickUnlockDowngradeWarning("pin")
+  readonly property string fpDowngradeWarning: quickUnlockDowngradeWarning("fingerprint")
+  readonly property string fidoDowngradeWarning: quickUnlockDowngradeWarning("fido")
+
   function beginPinSetup() {
     pinSetupPin = ""
     pinSetupConfirm = ""
     pinSetupMaster = ""
     pinError = ""
     pinUnlockError = ""
+    pinDowngradeConfirmed = false
     screenBeforeSettings = "main"
     currentScreen = "pin"
     Qt.callLater(function() { presenter.focusField("pinSetupPin") })
@@ -4984,25 +5183,51 @@ Item {
   }
 
   // The typed master password must open the envelope; a PIN wrap (Argon2id of
-  // the PIN) is added. Nothing typed is stored.
+  // the PIN) is added. Nothing typed is stored. With pinentry, both are typed
+  // there (requestSetupSecrets()) and the fields are not used.
   function submitPinSetup() {
     if (pinBusy) return
+    if (!quickUnlockAvailable) { pinError = quickUnlockUnavailableReason; return }
+    // A FIDO2 wrap already in the envelope: the PIN would be what protects
+    // the stored password. Say so and ask for a second press.
+    if (pinDowngradeWarning && !pinDowngradeConfirmed) {
+      pinDowngradeConfirmed = true
+      pinError = Model.downgradeConfirmText(pinDowngradeWarning)
+      return
+    }
+    if (pinentryAvailable) {
+      pinError = ""
+      requestSetupSecrets(true, function(secrets) {
+        if (secrets) root.savePinSetup(secrets.master, secrets.pin)
+      })
+      return
+    }
+    if (typedSecretWaits) { pinError = "Waiting for the vault helper. Try again in a moment."; return }
     var err = Model.validatePin(pinSetupPin, pinSetupConfirm)
     if (err) { pinError = err; return }
-    if (!quickUnlockAvailable) { pinError = quickUnlockUnavailableReason; return }
     if (!pinSetupMaster) { pinError = "Confirm your master password to set a PIN"; return }
+    var typed = pinSetupMaster
+    pinSetupMaster = ""
+    savePinSetup(typed, pinSetupPin)
+  }
 
+  // `master` and `pin` are typed, or references to what pinentry took, which
+  // the helper fills in for the envelope tool; a reference is forgotten when
+  // the write ends.
+  function savePinSetup(master, pin) {
     pinError = ""
     pinUnlockError = ""
     pinBusy = true
-    var typed = pinSetupMaster
-    var pin = {}
-    pin[Model.pinEnvVar()] = pinSetupPin
-    pinSetupMaster = ""
+    var typed = master
+    var pinEnv = {}
+    pinEnv[Model.pinEnvVar()] = pin
     beginEpochOperation("pinAdd")
-    addQuickUnlockMethod(typed, { kind: "add-pin" }, pin, function(ok, why) {
+    addQuickUnlockMethod(typed, { kind: "add-pin" }, pinEnv, function(ok, why) {
+      root.forgetHeldPassword(typed)
+      root.forgetHeldPassword(pin)
       typed = ""
-      pin = null
+      pin = ""
+      pinEnv = null
       root.pinBusy = false
       // Stale by the time it landed: remove the unwanted wrap.
       if (root.epochOperationIsStale("pinAdd") || root.currentScreen !== "pin") {
@@ -5049,11 +5274,11 @@ Item {
     pinUnlockSubmitted = true
     heldPinName = Model.heldSecretName(held)
     if (quickUnlockAvailable && accountId && envelopeSummary && envelopeSummary.pin) {
-      var env = {}
-      env[Model.pinEnvVar()] = held || String(pinEntry || "")
+      var secrets = {}
+      secrets[Model.pinEnvVar()] = held || String(pinEntry || "")
       queueEnvelopeJob({
         command: Model.unlockEnvelopeOpenCommand(envelopeTool(), envelopeAccount(), { kind: "pin" }),
-        env: env, secretOutput: true, holdOutput: true, unlock: true, method: "pin",
+        secrets: secrets, secretOutput: true, holdOutput: true, unlock: true, method: "pin",
         onDone: function(code, out) { root.onEnvelopePinResult(code, out) },
         onDropped: function(cancelled) { root.onPinJobDropped(cancelled) }
       })
@@ -5332,7 +5557,14 @@ Item {
   // fingerprint on (no secret involved) a PIN or key adds nothing, and those
   // rows say so.
   function settingNote(entry) {
-    if (!entry || (entry.key !== "pinUnlock" && entry.key !== "fidoUnlock")) return ""
+    if (!entry) return ""
+    // The last store refused: the setting is on but doing nothing.
+    if (entry.key === "rememberSession") {
+      if (!rememberSession || !rememberSessionProblem) return ""
+      return "Not in effect: " + rememberSessionProblem
+        + " The session is not stored, so a shell restart asks for your password."
+    }
+    if (entry.key !== "pinUnlock" && entry.key !== "fidoUnlock") return ""
     if (!settingValue(entry) || !fingerprintUnlock || !fingerprintStored) return ""
     return "Fingerprint unlock is also on, so the stored password is only as protected as "
       + "fingerprint unlock: a program running as you can open it without the "
@@ -5618,6 +5850,7 @@ Item {
   function beginFingerprintSetup() {
     fpSetupMaster = ""
     fpError = ""
+    fpDowngradeConfirmed = false
     currentScreen = "fingerprint"
     Qt.callLater(function() { presenter.focusField("fpMaster") })
   }
@@ -5631,24 +5864,52 @@ Item {
   }
 
   // The typed master password must open the envelope; a fingerprint wrap is
-  // added. Nothing typed is stored.
+  // added. Nothing typed is stored. With pinentry it is typed there
+  // (requestSetupSecrets()) and the field is not used.
   function submitFingerprintSetup() {
     if (fpBusy) return
     if (!quickUnlockAvailable) {
       fpError = quickUnlockUnavailableReason
       return
     }
+    // A FIDO2 wrap already in the envelope: a fingerprint releases no
+    // secret, so the seal alone would protect the stored password. Say so
+    // and ask for a second press.
+    if (fpDowngradeWarning && !fpDowngradeConfirmed) {
+      fpDowngradeConfirmed = true
+      fpError = Model.downgradeConfirmText(fpDowngradeWarning)
+      return
+    }
+    if (pinentryAvailable) {
+      fpError = ""
+      requestSetupSecrets(false, function(secrets) {
+        if (secrets) root.saveFingerprintSetup(secrets.master)
+      })
+      return
+    }
+    if (typedSecretWaits) {
+      fpError = "Waiting for the vault helper. Try again in a moment."
+      return
+    }
     if (!fpSetupMaster) {
       fpError = "Confirm your master password to enable fingerprint unlock"
       return
     }
+    var typed = fpSetupMaster
+    fpSetupMaster = ""
+    saveFingerprintSetup(typed)
+  }
+
+  // `master` is typed, or a reference to what pinentry took, forgotten when
+  // the write ends.
+  function saveFingerprintSetup(master) {
     fpError = ""
     fpBusy = true
     fpSetupActive = true
-    var typed = fpSetupMaster
-    fpSetupMaster = ""
+    var typed = master
     beginEpochOperation("fingerprintAdd")
     addQuickUnlockMethod(typed, { kind: "add-fingerprint" }, null, function(ok, why) {
+      root.forgetHeldPassword(typed)
       typed = ""
       root.fpBusy = false
       // Stale by the time it landed: remove the unwanted wrap.
@@ -5724,19 +5985,33 @@ Item {
   // Step back from the key without abandoning the request it is holding.
   function releaseFidoUnlock() { fidoUnlocker.releaseSurface() }
   function beginFidoSetup() { fidoUnlocker.beginSetup() }
-  function submitFidoSetup() { fidoUnlocker.submitSetup() }
+  // The master password the form confirms comes from pinentry when it is
+  // available (requestSetupSecrets()), else from the form's field; the
+  // unlocker takes either and forgets a reference when its write ends.
+  function submitFidoSetup() {
+    if (!pinentryAvailable) {
+      if (typedSecretWaits) { fidoUnlocker.error = "Waiting for the vault helper. Try again in a moment."; return }
+      fidoUnlocker.submitSetup("")
+      return
+    }
+    if (fidoBusy) return
+    if (!quickUnlockAvailable) { fidoUnlocker.error = quickUnlockUnavailableReason; return }
+    requestSetupSecrets(false, function(secrets) {
+      if (secrets) fidoUnlocker.submitSetup(secrets.master)
+    })
+  }
   function runFidoSetup() { fidoUnlocker.runOmarchySetup() }
   function forgetFidoUnlock() { fidoUnlocker.forget("") }
 
-  // Arm the FIDO2 key if one is ready, else the reader; both stay offered.
+  // Arm the reader when it is the method on offer. The FIDO2 key is never
+  // armed by a screen appearing: its touch answers one request, and a
+  // request waiting on the key while the user is doing something else
+  // (an SSH prompt, a sudo touch) would be answered by that touch. The key
+  // is asked only on an explicit "Unlock with FIDO2 Key" (startFidoUnlock());
+  // the probe still runs so the button is offered as soon as a key is in.
   function armPresenceUnlock() {
-    if (fidoReady) {
-      startFidoUnlock()
-      return
-    }
-    // Re-probe: a key plugged in since the last probe arms itself when the
-    // answer lands.
     if (fidoUnlock) fidoUnlocker.refresh()
+    if (fidoReady) return
     startFingerprintUnlock()
   }
 
@@ -5744,18 +6019,20 @@ Item {
   // Typed secrets in pinentry
   // -------------------------------------------------------------------------
   //
-  // The master password (unlock, re-prompt) and the PIN are typed into
-  // `pinentry`, a separate process, not into the panel: a string typed into
-  // the shell stays in its heap after it is cleared and lands in a shell core
-  // dump. The pinentry runs through the vault helper (Model.pinentryCommand()),
-  // which holds what was typed under a name; the shell sees only that name,
-  // and uses it like the password a quick-unlock method produced
-  // (Model.heldSecretRef()). Not available without the helper: while it is
-  // starting, restarting or left stopped the panel waits for it rather than
-  // offer its own field, which is used only where Model.typedSecretEntry()
-  // says (pinentry off, missing or declined, or the vault held in the shell
-  // as allowVaultWithoutHelper allows). Email login and the item forms are
-  // not covered.
+  // The master password (unlock, re-prompt, login, and the one a quick-unlock
+  // setup confirms), the PIN and a new PIN are typed into `pinentry`, a
+  // separate process, not into the panel: a string typed into the shell stays
+  // in its heap after it is cleared and lands in a shell core dump. The
+  // pinentry runs through the vault helper (Model.pinentryCommand()), which
+  // holds what was typed under a name; the shell sees only that name, and
+  // uses it like the password a quick-unlock method produced
+  // (Model.heldSecretRef()): the FIFO writer, `bw login` and the envelope
+  // tool get the value from the helper, in their own environment. Not
+  // available without the helper: while it is starting, restarting or left
+  // stopped the panel waits for it rather than offer its own field, which is
+  // used only where Model.typedSecretEntry() says (pinentry off, missing or
+  // declined, or the vault held in the shell as allowVaultWithoutHelper
+  // allows). The item forms are not covered.
   //
   // Set only by a probe that ran to its end and found no such program
   // (Model.pinentryProbeMissing()): a probe killed or still running leaves
@@ -5775,6 +6052,9 @@ Item {
   readonly property string typedSecretEntry: Model.typedSecretEntry({ usePinentry: usePinentry,
     missing: pinentryMissing, declined: pinentryDeclined, helperState: vaultHelperState })
   readonly property bool pinentryAvailable: typedSecretEntry === "pinentry"
+  // Pinentry will be used, once the helper it runs under is up: the forms
+  // that would take a master password or PIN offer no field meanwhile.
+  readonly property bool typedSecretWaits: typedSecretEntry === "wait"
   // Between the panel hiding for pinentry and pinentry's answer.
   property bool pinentryActive: false
   property var pinentryRun: null
@@ -5824,17 +6104,25 @@ Item {
     pinentryProbeProc.running = true
   }
 
-  // Runs pinentry for `purpose` ("unlock", "pin", "reprompt"), with `error`
-  // shown above the field on a retry. `done({ state, name })`: state is "ok"
-  // (the helper holds the answer as `name`), "cancelled", "empty", "failed" or
-  // "unavailable" (not run). The panel is hidden meanwhile so pinentry can
-  // take the keyboard, and shown again after `done` returns, unless `done`
-  // asked again.
-  function requestPinentry(purpose, error, done) {
+  // Runs pinentry for `purpose` (Model.pinentryDescription(): "unlock",
+  // "pin", "reprompt", "login", "setupMaster", "newPin", "fidoPin": the FIDO2
+  // key's own PIN, for a registration that asks for it), with `error` shown
+  // above the field on a retry. `done({ state, name })`: state is "ok" (the
+  // helper holds the answer as `name`, for a VaultProcess to inject by
+  // Model.heldSecretRef(name)), "cancelled", "empty", "short", "digits",
+  // "norepeat", "failed" or "unavailable" (not run). `opts` (optional):
+  // { minLength, repeat, digits } as Model.pinentryCommand() takes them; a
+  // "pin" purpose has the unlock's floor without them. The panel is hidden
+  // meanwhile so pinentry can take the keyboard, and shown again after `done`
+  // returns, unless `done` asked again. Any flow that needs a typed secret
+  // kept out of the shell (another secret a key or a tool wants) goes
+  // through here with a purpose of its own.
+  function requestPinentry(purpose, error, done, opts) {
     if (!pinentryAvailable || pinentryRun !== null || pinentryProc.running || pinentryProc.runId !== 0) {
       done({ state: "unavailable", name: "" })
       return
     }
+    var o = opts || {}
     var name = newHeldName()
     pinentryRun = { purpose: purpose, name: name, done: done }
     beginPinentry()
@@ -5844,8 +6132,12 @@ Item {
       prompt: Model.pinentryPrompt(purpose),
       error: error,
       // The unlock's own floor, as for the field: a shorter PIN is asked for
-      // again, not counted as a wrong attempt.
-      minLength: purpose === "pin" ? Model.pinUnlockMinLength() : 0
+      // again, not counted as a wrong attempt. A FIDO2 PIN is 4 or more by
+      // CTAP; asking again costs nothing, a wrong one costs a retry on the key.
+      minLength: o.minLength !== undefined ? o.minLength
+        : (purpose === "pin" ? Model.pinUnlockMinLength() : (purpose === "fidoPin" ? Model.fidoPinMinLength() : 0)),
+      repeat: o.repeat || "",
+      digits: o.digits === true
     }
     pinentryProc.command = Model.pinentryCommand(pinentryProgramName, ask)
     // The description names the account: environment, not argv.
@@ -5870,6 +6162,8 @@ Item {
     else if (exitCode === E.cancelled && String(stderrText || "").trim() === "") state = "cancelled"
     else if (exitCode === E.empty) state = "empty"
     else if (exitCode === E.short) state = "short"
+    else if (exitCode === E.digits) state = "digits"
+    else if (exitCode === E.norepeat) state = "norepeat"
     if (state !== "ok") forgetVaultSecret(run.name)
     // Not remembered (see pinentryDeclined): the user picks the field.
     pinentryNotice = state === "failed" ? Model.pinentryFailedNotice() : ""
@@ -6006,6 +6300,80 @@ Item {
         if (outcome === "wrong") root.submitRepromptWithPinentry("That is not your master password.")
       })
     })
+  }
+
+  // The login's master password (email and API key), typed into pinentry:
+  // the helper holds it under this name for as long as the attempt lasts (a
+  // two-step code, a new-device code, a retry of the FIFO writer all send it
+  // again), and loginPassword stays empty. submitLogin() asks for it; the
+  // name goes with the attempt (clearLoginAttempt()), with a refusal
+  // (onLoginOutput()), or to the stored password once `bw` accepts it.
+  property string loginMasterName: ""
+
+  // What a login sends as its password: the field, or a reference to what
+  // pinentry took (Model.heldSecretRef()), which the helper fills in for the
+  // FIFO writer and the API-key login. Both are passed around as one string
+  // and tested the same way; only the helper can tell them apart.
+  function loginSecret() {
+    if (loginMasterName) return Model.heldSecretRef(loginMasterName)
+    return String(loginPassword === undefined || loginPassword === null ? "" : loginPassword)
+  }
+
+  function forgetLoginMaster() {
+    var name = loginMasterName
+    loginMasterName = ""
+    if (name) forgetVaultSecret(name)
+  }
+
+  // The login as submitted, once pinentry has the master password. `bw`
+  // starts first (prepareEmailLogin()) so it is waiting on the FIFO by the
+  // time the answer is in, as it is when the field takes focus.
+  function submitLoginWithPinentry() {
+    if (pinentryActive) return
+    prepareEmailLogin()
+    requestPinentry("login", "", function(r) {
+      if (r.state === "ok") {
+        root.loginMasterName = r.name
+        root.submitLogin()
+      } else if (r.state === "empty") {
+        root.errorMessage = "Master password is required"
+      }
+    })
+  }
+
+  // The master password a quick-unlock setup form confirms and, for the PIN
+  // form, the new PIN, typed into pinentry: `done({ master, pin })` with
+  // references the helper holds (pin "" when not asked for), or done(null)
+  // for a cancel or a failure, which the notice already describes. The PIN
+  // is typed twice in one window (SETREPEAT) and checked there for its
+  // length and for digits, as the form's fields check it; a pinentry that
+  // cannot take it twice is refused, since nothing confirmed what was typed,
+  // and the notice offers the fields. The caller forgets both references
+  // when its write ends.
+  function requestSetupSecrets(withPin, done) {
+    var askPin = function(masterName, error) {
+      root.requestPinentry("newPin", error, function(r) {
+        if (r.state === "ok") {
+          done({ master: Model.heldSecretRef(masterName), pin: Model.heldSecretRef(r.name) })
+          return
+        }
+        if (r.state === "empty") { askPin(masterName, "Enter a PIN."); return }
+        if (r.state === "short") { askPin(masterName, "PIN must be at least " + Model.pinMinLength() + " digits"); return }
+        if (r.state === "digits") { askPin(masterName, "PIN must contain only digits"); return }
+        root.forgetVaultSecret(masterName)
+        if (r.state === "norepeat") root.pinentryNotice = Model.pinentryNoRepeatNotice()
+        done(null)
+      }, { minLength: Model.pinMinLength(), repeat: Model.pinentryRepeatPrompt(), digits: true })
+    }
+    var askMaster = function(error) {
+      root.requestPinentry("setupMaster", error, function(r) {
+        if (r.state === "empty") { askMaster("Enter your master password."); return }
+        if (r.state !== "ok") { done(null); return }
+        if (!withPin) { done({ master: Model.heldSecretRef(r.name), pin: "" }); return }
+        askPin(r.name, "")
+      })
+    }
+    askMaster("")
   }
 
   // -------------------------------------------------------------------------
@@ -6398,6 +6766,7 @@ Item {
     genBusy = false
     pendingUnlockPassword = ""
     sessionStorePending = false
+    sessionRemembered = false
     dropVaultSecrets()
   }
 
@@ -8323,11 +8692,14 @@ Item {
   property bool screenIsLocked: false
   property double screenLockCheckedAt: 0
 
+  // An undetermined reading counts as locked for the agent (no prompt over
+  // a screen that may be locked), but locks nothing.
   function onScreenLockState(raw) {
-    root.screenIsLocked = Model.screenIsLocked(raw)
+    var locked = Model.screenIsLocked(raw)
+    root.screenIsLocked = locked || Model.screenLockUndetermined(raw)
     root.screenLockCheckedAt = Date.now()
     if (!lockOnScreenLock || status !== "unlocked") return
-    if (root.screenIsLocked) lockVault()
+    if (locked) lockVault()
   }
 
   function onSleepSignal(line) {
@@ -8337,6 +8709,19 @@ Item {
       suspendLockPending = false
       // The watchdog handles an expired countdown; just refresh stale state.
       if (opened) refreshStatus()
+      return
+    }
+    // Shutdown or reboot: the session must not outlive the boot, whatever
+    // the settings say, since the shell is killed rather than unloaded and a
+    // remembered key stays valid in bw until `bw lock`.
+    if (token === Model.shutdownSignalToken()) {
+      if (status !== "unlocked") {
+        ackSleep()
+        return
+      }
+      suspendLockPending = true
+      lockVault()
+      maybeAckSleep()
       return
     }
     if (token !== Model.sleepSignalToken()) return
@@ -8594,11 +8979,13 @@ Item {
     onTriggered: root.applySshAgentEvent({ kind: "restartTimer", nowMs: Date.now() })
   }
 
-  // Holds the sleep inhibitor, so it runs whenever the setting is on, not only
-  // while unlocked (it must already be listening when suspend is announced).
+  // Holds the sleep and shutdown inhibitors, so it runs all the time, not
+  // only while unlocked (it must already be listening when suspend or
+  // shutdown is announced). lockOnSuspend decides what a sleep does
+  // (onSleepSignal()); a shutdown locks regardless.
   Process {
     id: sleepMonitorProc
-    running: root.live && root.lockOnSuspend
+    running: root.live
     // Closing this pipe tears down the monitor's entire process group.
     stdinEnabled: true
     command: Model.sleepMonitorCommand()
@@ -8899,15 +9286,15 @@ Item {
 
   // ---- Legacy PIN blob ----
   //
-  // Decrypted in one process with the PIN from the environment, so only the
-  // result reaches QML.
+  // Decrypted in one process with the PIN from its stdin, so only the result
+  // reaches QML and no environment holds the PIN.
 
   VaultProcess {
     id: pinUnlockProc
     vault: root
     session: false
     command: Model.pinUnlockCommand(root.activeSlot)
-    environment: root.pinEnv(root.heldPinName ? Model.heldSecretRef(root.heldPinName) : root.pinEntry)
+    secrets: root.pinSecrets(root.heldPinName ? Model.heldSecretRef(root.heldPinName) : root.pinEntry)
     stdout: VaultCollector { id: pinUnlockStdout; waitForEnd: true }
     onExited: function(exitCode) {
       if (root.finishScrubRun(pinUnlockProc)) return
@@ -9542,6 +9929,8 @@ Item {
         fidoReady: root.fidoReady,
         fingerprintScanning: root.fingerprintScanning,
         fidoScanning: root.fidoScanning,
+        // Whether a shell restart would reopen the vault from the keyring.
+        sessionRemembered: root.sessionRemembered,
         views: views
       })
     }

@@ -913,7 +913,8 @@ check("a clock stepped backwards closes the window rather than reopening it",
 
 check("only a login stopped on a challenge is kept, and only with a password to submit",
   /show2faField && !showDeviceCodeField && !show2faMethodPicker[\s\S]{0,60}return false/.test(pendingSecondFactor)
-    && /!String\(loginPassword \|\| ""\)[\s\S]{0,40}return false/.test(pendingSecondFactor)
+    // The field, or the name the helper holds a pinentry answer under.
+    && /!loginSecret\(\)[\s\S]{0,40}return false/.test(pendingSecondFactor)
     && /status !== "unauthenticated"[\s\S]{0,60}return false/.test(pendingSecondFactor)
     && /Model\.secondFactorWindowOpen\(secondFactorStartedAt/.test(pendingSecondFactor),
   pendingSecondFactor)
@@ -1000,7 +1001,7 @@ check("the interactive flag is set before the process that reads it starts",
        < startDevice.indexOf("loginProc.running = true"),
   startDevice)
 check("the password is delivered to the interactive login the same way as any other",
-  /writeAuthPassword\("login", loginPassword\)/.test(startDevice), startDevice)
+  /writeAuthPassword\("login", loginSecret\(\)\)/.test(startDevice), startDevice)
 check("a prewarmed ordinary login is stopped before the interactive one starts",
   /loginProc\.running[\s\S]{0,200}deviceVerificationPending\s*=\s*true[\s\S]{0,200}return/.test(submitDevice)
     && /deviceVerificationPending[\s\S]{0,120}startDeviceVerificationLogin/.test(panelSrc),
@@ -1260,5 +1261,50 @@ check("the Unlock button waits for a known locked vault",
   /canSubmit: form\.vault\.status === "locked"/.test(unlockFormSrc)
     && /enabled: !form\.busy && form\.canSubmit/.test(unlockFormSrc),
   "the button can be pressed while status is still checking")
+
+// -------------------------------------------------------------------------
+// The login's master password through pinentry
+// -------------------------------------------------------------------------
+//
+// With pinentry available, submitLogin() asks for the master password there
+// and the helper holds it under a name; the FIFO writer and the API-key
+// login get it by that name, injected by the helper into their own
+// environment. The panel draws its field only where the vault says so.
+
+const serviceSrc = read("Service.qml")
+const submitLoginBody = functionBody(serviceSrc, "submitLogin")
+check("both login methods ask pinentry for a missing master password when it is available",
+  (submitLoginBody.match(/if \(pinentryAvailable\) \{\s*submitLoginWithPinentry\(\)\s*return\s*\}/g) || []).length === 2,
+  submitLoginBody)
+check("and send what the helper holds, never the field, once it answered",
+  /var pass = loginSecret\(\)/.test(submitLoginBody) && /var pass2 = loginSecret\(\)/.test(submitLoginBody)
+    && !/String\(loginPassword/.test(submitLoginBody)
+    && /return Model\.heldSecretRef\(loginMasterName\)/.test(functionBody(serviceSrc, "loginSecret")), submitLoginBody)
+check("the API-key login's environment takes the held reference too",
+  /return authEnv\(loginSecret\(\),/.test(functionBody(serviceSrc, "loginProcessEnv")), functionBody(serviceSrc, "loginProcessEnv"))
+check("the held name goes with the attempt",
+  /^\s*forgetLoginMaster\(\)/m.test(functionBody(serviceSrc, "clearLoginAttempt")), functionBody(serviceSrc, "clearLoginAttempt"))
+const loginOutputBody = functionBody(serviceSrc, "onLoginOutput")
+check("a refused login forgets the held password before saying why",
+  /forgetLoginMaster\(\)\s*\n\s*if \(err\) \{\s*\n\s*logLogin\("bw-error"/.test(loginOutputBody)
+    && /forgetLoginMaster\(\)[\s\S]{0,120}logLogin\("device-unanswerable"/.test(loginOutputBody)
+    && /forgetLoginMaster\(\)[\s\S]{0,120}logLogin\("no-usable-provider"/.test(loginOutputBody)
+    && /forgetLoginMaster\(\)[\s\S]{0,120}logLogin\("code-channel-missing"/.test(loginOutputBody), loginOutputBody)
+check("a challenge keeps it: no forget on the second-factor, method and device stages",
+  !/forgetLoginMaster\(\)[\s\S]{0,200}logLogin\("(second-factor|method-choice|device-verification|device-code-rejected)"/.test(loginOutputBody),
+  loginOutputBody)
+check("the password writer and the logins run under the vault helper, which fills in a held name",
+  /VaultProcess \{\s*id: authPasswordWriterProc\s*vault: root\s*session: false\s*environment: root\.authEnv\(root\.authPasswordWriteValue/.test(serviceSrc)
+    && /VaultProcess \{\s*id: loginProc/.test(serviceSrc)
+    && /var held = Model\.heldSecretName\(proc\.environment\[key\]\)\s*\n\s*if \(held\) inject\[key\] = "secret:" \+ held/.test(functionBody(serviceSrc, "vaultStart")),
+  "the writer's BW_PASSWORD reaches it from the helper, by name, not from the shell")
+const panelOnly = read("Panel.qml")
+check("the login fields are drawn only where the vault says to type here",
+  /Row \{\s*visible: root\.vault\.typedSecretEntry === "field"[\s\S]{0,200}id: loginPassField/.test(panelOnly)
+    && /id: apiMasterField\s*visible: root\.vault\.typedSecretEntry === "field"/.test(panelOnly)
+    && (panelOnly.match(/PinentryHint \{/g) || []).length >= 4, "")
+check("the fields stay bound to loginPassword, which pinentry leaves empty",
+  /loginPassField\.text = Qt\.binding\(function\(\) \{ return root\.vault\.loginPassword \}\)/.test(panelOnly)
+    && !/\bloginPassword\s*=[^=]/.test(functionBody(serviceSrc, "submitLoginWithPinentry")), "")
 
 done()

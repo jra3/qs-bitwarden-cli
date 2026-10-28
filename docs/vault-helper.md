@@ -17,8 +17,8 @@ The [README](../README.md#how-your-vault-is-held) has the short version.
 | The item list | every item in full | names, usernames, websites, folders, flags such as "has a password" |
 | Passwords, TOTP keys, passkeys, password history, notes, card numbers and codes, identity numbers, hidden custom fields | yes | only a value you reveal, while it is revealed; the whole item while you edit it |
 | The master password a PIN, fingerprint or FIDO2 key opens | yes, for that unlock | a reference by name |
-| What you type: the master password and PIN for unlocking, and the master password for a re-prompt | yes: typed into pinentry, a separate process, and passed to the helper | a reference by name |
-| What else you type: the email login, the master password and new PIN when setting up PIN, fingerprint or FIDO2 unlock, and an item's fields | | yes, until you submit, and in memory after |
+| What you type: the master password for unlocking, for a re-prompt, for the email and API-key login and when setting up PIN, fingerprint or FIDO2 unlock; the PIN for unlocking; the new PIN | yes: typed into pinentry, a separate process, and passed to the helper | a reference by name |
+| What else you type: the login email, an API key's client id and secret, two-step and device codes, and an item's fields | | yes, until you submit, and in memory after |
 
 Opening an item shows its name, username, websites, card brand, holder and
 expiry, identity name, email, address and phone, plain custom fields and
@@ -32,8 +32,15 @@ dump taken after you revealed something can still contain it.
 
 A password or other secret you copy goes from the helper straight to
 `wl-copy` (with the same timed clear and "sensitive" marking); it never passes
-through the shell. TOTP codes are computed in the helper, and only the code
-reaches the shell, not the key. Search runs in the helper too, so it still
+through the shell. The helper keeps a list of the copies it has serving, and
+a lock, logout or account switch ends them along with everything else it
+holds, so a copy that started just before the lock does not stay on the
+clipboard until its own timer runs out. The timer itself is the copy's
+(`timeout` around `wl-copy`), so a copy still clears on schedule if the
+helper or the shell dies first. Values the shell copies itself (TOTP codes,
+usernames, generated passwords, Send links) are not on that list; the lock
+clears them only if they are still the current selection. TOTP codes are
+computed in the helper, and only the code reaches the shell, not the key. Search runs in the helper too, so it still
 finds text in notes the shell does not have, and it stays fast on a large
 vault. Notes of an item that asks for the master password are not searched.
 
@@ -42,8 +49,12 @@ revealed, copied or edited, and its TOTP code is fetched only when you reveal
 or copy it.
 
 Locking, logging out and switching accounts tell the helper to forget
-everything. A lock that is still running `bw lock` keeps its own copy of the
-key until it finishes.
+everything, copies on the clipboard included. A lock that is still running
+`bw lock` keeps its own copy of the key until it finishes. A shell unload
+while unlocked starts a detached `bw lock` through the helper before it
+stops, unless the session is remembered and its keyring copy was checked to
+be in the memory-only collection; suspend, shutdown and reboot lock through
+the normal path under a logind delay inhibitor.
 
 ## How the shell talks to it
 
@@ -65,20 +76,93 @@ output is handed back as it is, except:
 - a password or PIN typed into pinentry (below) is kept, and the shell gets
   only whether there was an answer.
 
+## Where the secrets of quick unlock travel
+
+The pipelines that check, store and open the quick-unlock envelope (see the
+README's [How quick unlock stores your password](../README.md#how-quick-unlock-stores-your-password))
+run as `bash` scripts under the helper, between `secret-tool`, `systemd-creds`,
+`argon2`, `jq`, `fido2-assert` and the unlock tool. Three values pass through
+them that are worth more than the session key: the master password you typed
+(while it is checked against the stored copy, or stored), the unlock PIN, and
+the FIDO2 key's `hmac-secret`, which opens the key's way in and would do so
+again from any program that held it. None of them is ever in a process's
+environment or arguments. Linux lets every process running as you read
+another's `/proc/<pid>/environ` for as long as it runs, and a value in the
+shell's environment is inherited by every child, so an older build left the
+hmac-secret readable in `jq`, `head` and `secret-tool` for the length of an
+unlock.
+
+The route is:
+
+1. The panel hands the value to the helper as a `secrets` entry of the run
+   (by value, or by the name of a value the helper already holds, such as a
+   password typed into pinentry). It never goes in the run's `env`.
+2. The helper writes it to the run's stdin, ahead of anything else, as
+   `NAME=value` records ended by a NUL byte and closed by an empty record.
+3. The script's first statement reads those records into plain shell
+   variables, once, and stops at the empty record. They are never
+   `export`ed, so no process the script starts has them in its environment,
+   and the script's own environment never held them. A step nested in another
+   script runs as a subshell, which sees the variables and still has no
+   environment with them in.
+4. The one program that must have a value, the unlock tool, gets it on a
+   descriptor of its own: `--secrets-fd 3 3< <(...)`, a pipe written by the
+   shell's builtin `printf`, which only the tool and the shell ever hold. The
+   tool reads nothing from its environment. `argon2` reads the password or
+   PIN on its stdin the same way; `openssl`, for a PIN blob from an older
+   version, on a descriptor (`-pass fd:3`); and when `bw` has to check a
+   typed password itself, it reads a pipe as its `--passwordfile`, as the
+   unlock's FIFO is.
+5. The FIDO2 key's PIN, for a registration that asks for one, is typed into
+   pinentry and held by the helper by name, then travels as in 1 to 4;
+   `fido2-assert` reads it on its stdin, because it is run with no terminal
+   (`setsid`) and its passphrase prompt falls back to stdin then.
+
+What this does not change: `bw unlock` itself, on the ordinary path, still
+takes the password through its FIFO, and the session key still reaches every
+`bw` command in its environment ([Limits](#limits)). The hmac-secret is still
+a fixed function of the key and the salt in the envelope summary, so a touch
+given to a request someone else made yields the same secret; which is why the
+panel never asks the key for a touch on its own (below), and why a
+registration that asks for the key's PIN gets a secret a touch alone does not
+([FIDO2 key unlock](../README.md#fido2-key-unlock)).
+
+Falling back, with the vault held in the shell, the panel writes the same
+stdin block itself, and the values are then in the shell as everything else
+is.
+
 ## Typing into pinentry
 
 A string typed into the panel stays in the shell's memory after the field is
-cleared, so a shell core dump could hold it. The master password for
-unlocking and for a re-prompt, and the PIN, are therefore typed into
-`pinentry`, a separate process. The panel hides while it runs so it can take
-the keyboard, and shows again after.
+cleared, so a shell core dump could hold it. The master password, wherever
+the panel asks for it (unlocking, a re-prompt, the email or API-key login, and
+the confirmation when setting up PIN, fingerprint or FIDO2 unlock), the PIN,
+and a new PIN are therefore typed into `pinentry`, a separate process. The
+panel hides while it runs so it can take the keyboard, and shows again after.
 
 The helper runs a small script that speaks the pinentry protocol, and keeps
 what it prints, decoded, under a name; the shell only learns whether you
-answered or cancelled. The held password or PIN goes to `bw unlock`, the
-quick-unlock check or the re-prompt check by name, and is forgotten as soon as
-that has finished. A wrong password or PIN opens pinentry again with the
-reason.
+answered or cancelled. The held password or PIN goes to `bw unlock`,
+`bw login`, the quick-unlock check or the re-prompt check by name, and is
+forgotten as soon as that has finished. A wrong password or PIN opens pinentry
+again with the reason.
+
+A login keeps its name for the whole attempt: a two-step code, a new-device
+code and a retry of the password writer all send the same held password, and
+you are not asked for it again until the attempt ends (accepted, refused, or
+abandoned by closing the panel outside the second-factor window). The
+password `bw login` and `bw unlock` read from their FIFO is written by a
+small script that runs under the helper too, with the held password in its
+own environment: the shell asks for the write by name and never has the
+value.
+
+A new PIN is typed twice in the one pinentry window (its "Repeat" field), and
+pinentry itself refuses a pair that does not match. The script also checks
+the length floor and that it is all digits, as the panel's fields would, and
+asks again on a miss. A pinentry that cannot take a repeat (`pinentry-tty`,
+and older `pinentry-curses`) answers after one entry; since nothing confirmed
+what was typed, that PIN is not kept, and the panel says so and offers its
+fields.
 
 Pinentry closes itself after two minutes without an answer, which counts as
 a cancel.
@@ -144,8 +228,8 @@ what `pinentry` on your `PATH` runs; on some systems (Arch among them) it is a
 script that picks `pinentry-gnome3`. Set `pinentryProgram` to name a pinentry
 yourself.
 
-The email login, the setup of PIN, fingerprint and FIDO2 unlock (the master
-password and the new PIN) and the item forms are not covered.
+The item forms, the login email, an API key's client id and secret, and the
+two-step and new-device codes are not covered: they are typed into the panel.
 
 ## Hardening
 
@@ -172,9 +256,10 @@ other way, such as `gcr-prompter` for `pinentry-gnome3`
   `bw` command runs. That was true before the helper and is true of `bw`
   everywhere; see [SECURITY.md](../SECURITY.md) for what is in scope.
 - **What is on screen, and what you type, is in the shell.** That is what you
-  type into the panel's own fields (the email login, item fields, quick-unlock
-  setup, and the master password or PIN when pinentry is not used). Clearing it does not wipe
-  it, so it can stay in the shell's memory and be in a shell core dump.
+  type into the panel's own fields (the login email, API-key fields, two-step
+  and device codes, item fields, and the master password or PIN when pinentry
+  is not used). Clearing it does not wipe it, so it can stay in the shell's
+  memory and be in a shell core dump.
 - **The shell's core dumps are left on.** The plugin does not lower the
   shell's core-file limit. The limit is per process and inherited, so it would
   also turn off core dumps for every other plugin in the shell and for every
@@ -192,8 +277,12 @@ other way, such as `gcr-prompter` for `pinentry-gnome3`
 
 It is checked like the other helpers: present, executable, the right
 architecture, the checksum in `bin/SHA256SUMS`, its own self-test, and the
-protocol version. A locally built one (`vault/target/debug/`) is used if the
-shipped one is absent or unusable.
+protocol version. Without `bin/SHA256SUMS`, or without its line in it, the
+shipped binary is not run at all; the check reports an incomplete install. A
+locally built one (`vault/target/debug/`) is tried after the shipped one
+only when `allowDevelopmentHelpers` is `true` in `shell.json`; a plugin
+install never falls back to one on its own, since it has no recorded digest
+and no provenance.
 
 If none can be used when the shell starts, the vault stays locked: commands
 wait, and a banner says why and offers to check again, which runs the whole
@@ -224,4 +313,15 @@ The binary is built reproducibly and attested like the SSH helper
 ./scripts/build-agent.sh --compare-tracked
 gh attestation verify bin/x86_64-linux/qs-bitwarden-vault --repo Elevate08/qs-bitwarden-cli
 bin/x86_64-linux/qs-bitwarden-vault --self-test
+```
+
+From a linked worktree (`git worktree add`), `build-agent.sh` cannot enter the
+pinned image on its own: the container sees the checkout but not the gitdir
+it points at. `scripts/rebuild-helpers-local.sh` exports HEAD on the host and
+runs the same build there, as you rather than root:
+
+```bash
+./scripts/rebuild-helpers-local.sh            # compare bin/ with a build of HEAD
+./scripts/rebuild-helpers-local.sh write      # rebuild bin/ and SHA256SUMS after a source change
+./scripts/rebuild-helpers-local.sh test       # cargo test for every helper, in the same image
 ```

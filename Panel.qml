@@ -1532,6 +1532,18 @@ Panel {
                 font.pixelSize: Style.font.caption
                 wrapMode: Text.WordWrap
               }
+
+              // Adding this beside a FIDO2 wrap lowers the key to the seal.
+              Text {
+                textFormat: Text.PlainText
+                visible: root.vault.fpDowngradeWarning !== ""
+                width: parent.width
+                text: "󰀪  " + root.vault.fpDowngradeWarning
+                color: root.urgent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
             }
 
             Column {
@@ -1540,8 +1552,17 @@ Panel {
 
               Text { textFormat: Text.PlainText; text: "MASTER PASSWORD"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.bold: true }
 
+              // Typed into pinentry when it is available (submitFingerprintSetup()).
+              PinentryHint {
+                panel: root
+                vault: root.vault
+                what: "master password"
+                busy: root.vault.fpBusy
+              }
+
               LineField {
                 id: fpMasterField
+                visible: root.vault.typedSecretEntry === "field"
                 width: parent.width
                 placeholderText: "Confirm your master password..."
                 password: true
@@ -1568,13 +1589,13 @@ Panel {
                 spacing: Style.space(8)
 
                 Button {
-                  text: root.vault.fpBusy ? "Checking..." : "Enable"
-                  iconText: root.vault.fpBusy ? "󰑐" : "󰈷"
-                  iconSpinning: root.vault.fpBusy
+                  text: root.vault.fpBusy ? "Checking..." : (root.vault.typedSecretWaits ? "Waiting for the vault helper..." : "Enable")
+                  iconText: root.vault.fpBusy || root.vault.typedSecretWaits ? "󰑐" : "󰈷"
+                  iconSpinning: root.vault.fpBusy || root.vault.typedSecretWaits
                   selected: true
                   accent: Color.accent
                   fontFamily: root.fontFamily
-                  enabled: !root.vault.fpBusy
+                  enabled: !root.vault.fpBusy && !root.vault.typedSecretWaits
                   onClicked: root.vault.submitFingerprintSetup()
                 }
 
@@ -1989,14 +2010,38 @@ Panel {
               font.pixelSize: Style.font.bodySmall
               wrapMode: Text.WordWrap
             }
+
+            // Adding this beside a FIDO2 wrap lowers the key to an offline search.
+            Text {
+              textFormat: Text.PlainText
+              visible: root.vault.pinDowngradeWarning !== ""
+              width: parent.width
+              text: "󰀪  " + root.vault.pinDowngradeWarning
+              color: root.urgent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
           }
 
           Column {
             width: parent.width
             spacing: Style.space(8)
 
-            Text { textFormat: Text.PlainText; text: "MASTER PASSWORD"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.bold: true }
+            // With pinentry (submitPinSetup() in Service.qml) the master
+            // password and the new PIN, typed twice, are taken there: pinentry
+            // checks the PIN's length and digits, and this form's three fields
+            // are not drawn.
+            PinentryHint {
+              panel: root
+              vault: root.vault
+              what: "master password and new PIN"
+              busy: root.vault.pinBusy
+            }
+
+            Text { visible: root.vault.typedSecretEntry === "field"; textFormat: Text.PlainText; text: "MASTER PASSWORD"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.bold: true }
             LineField {
+              visible: root.vault.typedSecretEntry === "field"
               width: parent.width
               placeholderText: "Confirm your master password..."
               password: true
@@ -2007,6 +2052,7 @@ Panel {
             }
 
             Text {
+              visible: root.vault.typedSecretEntry === "field"
               textFormat: Text.PlainText
               text: "PIN"
               // The label turns red too, visible while typing in Confirm.
@@ -2017,6 +2063,7 @@ Panel {
             }
             LineField {
               id: pinSetupPinField
+              visible: root.vault.typedSecretEntry === "field"
               width: parent.width
               placeholderText: Model.pinRecommendedLength() + " digits or more..."
               password: true
@@ -2040,8 +2087,9 @@ Panel {
               wrapMode: Text.WordWrap
             }
 
-            Text { textFormat: Text.PlainText; text: "CONFIRM PIN"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.bold: true }
+            Text { visible: root.vault.typedSecretEntry === "field"; textFormat: Text.PlainText; text: "CONFIRM PIN"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.bold: true }
             LineField {
+              visible: root.vault.typedSecretEntry === "field"
               width: parent.width
               placeholderText: "Repeat the PIN..."
               password: true
@@ -2068,13 +2116,13 @@ Panel {
               spacing: Style.space(8)
 
               Button {
-                text: root.vault.pinBusy ? "Checking..." : "Save PIN"
-                iconText: root.vault.pinBusy ? "󰑐" : "󰄬"
-                iconSpinning: root.vault.pinBusy
+                text: root.vault.pinBusy ? "Checking..." : (root.vault.typedSecretWaits ? "Waiting for the vault helper..." : "Save PIN")
+                iconText: root.vault.pinBusy || root.vault.typedSecretWaits ? "󰑐" : "󰄬"
+                iconSpinning: root.vault.pinBusy || root.vault.typedSecretWaits
                 selected: true
                 accent: Color.accent
                 fontFamily: root.fontFamily
-                enabled: !root.vault.pinBusy
+                enabled: !root.vault.pinBusy && !root.vault.typedSecretWaits
                 onClicked: root.vault.submitPinSetup()
               }
 
@@ -2907,12 +2955,21 @@ Panel {
               }
             }
 
+            // Typed into pinentry when it is available (submitLoginWithPinentry()
+            // in Service.qml): the field is drawn only when the vault says so.
             Column {
               visible: root.vault.loginCredentialsStage
               width: parent.width
               spacing: Style.space(3)
               Text { textFormat: Text.PlainText; text: "MASTER PASSWORD"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.bold: true }
+              PinentryHint {
+                panel: root
+                vault: root.vault
+                what: "master password"
+                busy: root.vault.isLoading
+              }
               Row {
+                visible: root.vault.typedSecretEntry === "field"
                 width: parent.width
                 spacing: Style.space(6)
                 LineField {
@@ -3113,6 +3170,8 @@ Panel {
 
               Row {
                 width: parent.width
+                // Clear of the code field above, as the device-code row is.
+                topPadding: Style.space(3)
                 spacing: Style.space(6)
 
                 Button {
@@ -3142,12 +3201,12 @@ Panel {
               visible: !root.vault.show2faMethodPicker && !root.vault.showDeviceCodeField
               width: parent.width
               text: root.vault.emailLoginButtonText()
-              iconText: root.vault.logoutCleanupFailed ? "󰑐" : ((root.vault.logoutPending || root.vault.isLoading) ? "󰑐" : "󰌋")
-              iconSpinning: !root.vault.logoutCleanupFailed && (root.vault.logoutPending || root.vault.isLoading)
+              iconText: root.vault.logoutCleanupFailed ? "󰑐" : ((root.vault.logoutPending || root.vault.isLoading || root.vault.typedSecretWaits) ? "󰑐" : "󰌋")
+              iconSpinning: !root.vault.logoutCleanupFailed && (root.vault.logoutPending || root.vault.isLoading || root.vault.typedSecretWaits)
               selected: true
               accent: Color.accent
               fontFamily: root.fontFamily
-              enabled: root.vault.logoutCleanupFailed || (!root.vault.logoutPending && !root.vault.isLoading)
+              enabled: root.vault.logoutCleanupFailed || (!root.vault.logoutPending && !root.vault.isLoading && !root.vault.typedSecretWaits)
               onClicked: root.vault.logoutCleanupFailed ? root.vault.retryLogoutCleanup() : root.vault.submitLogin()
             }
           }
@@ -3190,8 +3249,15 @@ Panel {
               width: parent.width
               spacing: Style.space(3)
               Text { textFormat: Text.PlainText; text: "MASTER PASSWORD"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.bold: true }
+              PinentryHint {
+                panel: root
+                vault: root.vault
+                what: "master password"
+                busy: root.vault.isLoading
+              }
               LineField {
                 id: apiMasterField
+                visible: root.vault.typedSecretEntry === "field"
                 width: parent.width
                 placeholderText: "Master password to unlock vault..."
                 password: true
@@ -3204,13 +3270,13 @@ Panel {
 
             Button {
               width: parent.width
-              text: root.vault.logoutCleanupFailed ? "Retry Logout Cleanup" : (root.vault.logoutPending ? "Finishing logout..." : (root.vault.isLoading ? "Logging in..." : "Log In with API Key"))
-              iconText: root.vault.logoutCleanupFailed ? "󰑐" : ((root.vault.logoutPending || root.vault.isLoading) ? "󰑐" : "󰌋")
-              iconSpinning: !root.vault.logoutCleanupFailed && (root.vault.logoutPending || root.vault.isLoading)
+              text: root.vault.logoutCleanupFailed ? "Retry Logout Cleanup" : (root.vault.logoutPending ? "Finishing logout..." : (root.vault.isLoading ? "Logging in..." : (root.vault.typedSecretWaits ? "Waiting for the vault helper..." : "Log In with API Key")))
+              iconText: root.vault.logoutCleanupFailed ? "󰑐" : ((root.vault.logoutPending || root.vault.isLoading || root.vault.typedSecretWaits) ? "󰑐" : "󰌋")
+              iconSpinning: !root.vault.logoutCleanupFailed && (root.vault.logoutPending || root.vault.isLoading || root.vault.typedSecretWaits)
               selected: true
               accent: Color.accent
               fontFamily: root.fontFamily
-              enabled: root.vault.logoutCleanupFailed || (!root.vault.logoutPending && !root.vault.isLoading)
+              enabled: root.vault.logoutCleanupFailed || (!root.vault.logoutPending && !root.vault.isLoading && !root.vault.typedSecretWaits)
               onClicked: root.vault.logoutCleanupFailed ? root.vault.retryLogoutCleanup() : root.vault.submitLogin()
             }
           }

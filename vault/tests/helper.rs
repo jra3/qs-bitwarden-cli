@@ -85,7 +85,7 @@ impl Helper {
     }
 
     fn exec(&mut self, id: u64, script: &str, extra: Value) -> Value {
-        let mut request = json!({ "type": "exec", "v": 1, "id": id, "argv": ["sh", "-c", script] });
+        let mut request = json!({ "type": "exec", "v": 2, "id": id, "argv": ["sh", "-c", script] });
         for (k, v) in extra.as_object().unwrap() {
             request[k] = v.clone();
         }
@@ -94,7 +94,7 @@ impl Helper {
     }
 
     fn query(&mut self, q: u64, mut request: Value) -> Value {
-        request["v"] = json!(1);
+        request["v"] = json!(2);
         request["q"] = json!(q);
         self.send(request);
         self.reply("q", q)
@@ -131,8 +131,8 @@ fn vault_read() -> String {
 #[test]
 fn handshake_and_strictness() {
     let mut helper = Helper::start();
-    helper.send(json!({ "type": "hello", "v": 1 }));
-    assert_eq!(helper.next(), json!({ "type": "ready", "protocol": 1 }));
+    helper.send(json!({ "type": "hello", "v": 2 }));
+    assert_eq!(helper.next(), json!({ "type": "ready", "protocol": 2 }));
     helper.send(json!({ "type": "hello", "v": 9 }));
     assert_eq!(helper.next()["type"], "error");
     writeln!(helper.stdin, "not json").unwrap();
@@ -180,8 +180,8 @@ fn the_session_key_goes_to_runs_and_never_back() {
     );
     assert_eq!(env["out"], "x-gone\n");
 
-    helper.send(json!({ "type": "holdSession", "v": 1, "name": "lock1" }));
-    helper.send(json!({ "type": "forget", "v": 1, "keep": ["lock1"] }));
+    helper.send(json!({ "type": "holdSession", "v": 2, "name": "lock1" }));
+    helper.send(json!({ "type": "forget", "v": 2, "keep": ["lock1"] }));
     let after = helper.exec(5, &check, json!({ "inject": { "BW_SESSION": "session" } }));
     assert_eq!(after["out"], "", "forget drops the key");
     let kept = helper.exec(
@@ -214,7 +214,7 @@ fn a_held_secret_is_injected_by_name() {
         json!({ "inject": { "PW": "secret:master" } }),
     );
     assert_eq!(run["out"], "master pw");
-    helper.send(json!({ "type": "forgetSecret", "v": 1, "name": "master" }));
+    helper.send(json!({ "type": "forgetSecret", "v": 2, "name": "master" }));
     assert_eq!(
         helper.exec(
             3,
@@ -223,6 +223,37 @@ fn a_held_secret_is_injected_by_name() {
         )["out"],
         ""
     );
+}
+
+/// A password, PIN or hmac-secret goes to a run on stdin, as NUL-ended
+/// records, and never into its environment, which every process of the same
+/// user can read. The panel's text follows the block.
+#[test]
+fn secrets_reach_a_run_on_stdin_and_never_its_environment() {
+    let mut helper = Helper::start();
+    helper.exec(1, "printf 'held pw'", json!({ "capture": "secret:master" }));
+    // Read the block as the panel's scripts do, then the rest of stdin.
+    let script = "while IFS= read -r -d '' rec && [ -n \"$rec\" ]; do printf '[%s]' \"$rec\"; done; \
+        printf '|'; cat; printf '|%s' \"${QSBW_SECRET-unset}${QSBW_PIN-unset}\"; env | grep -c QSBW_ | tr -d '\\n' || true";
+    let run = helper.exec(
+        2,
+        script,
+        json!({ "secrets": { "QSBW_SECRET": "typed\npw", "ZZ": "" }, "heldSecrets": { "QSBW_PIN": "secret:master", "NOPE": "secret:gone" },
+                "stdin": "rest" }),
+    );
+    assert_eq!(
+        run["out"],
+        "[QSBW_SECRET=typed\npw][ZZ=][QSBW_PIN=held pw]|rest|unsetunset0"
+    );
+    // Present and empty: only the end record, so a reader never waits.
+    let bare = helper.exec(3, "od -An -c | tr -d ' \n'", json!({ "secrets": {} }));
+    assert_eq!(bare["out"], "\\0");
+    // Absent: stdin is as before (nothing at all).
+    let none = helper.exec(4, "od -An -c | tr -d ' \n'", json!({}));
+    assert_eq!(none["out"], "");
+    // A name that is not a variable is refused before anything runs.
+    let refused = helper.exec(5, "true", json!({ "secrets": { "A=B": "x" } }));
+    assert_eq!(refused["code"], 126);
 }
 
 #[test]
@@ -258,6 +289,54 @@ fn a_pinentry_answer_is_decoded_and_injected_by_name() {
         ),
         (Some(""), Some(false), Some(1))
     );
+}
+
+#[test]
+fn a_pinentry_answer_feeds_the_password_writer_and_bw_login_by_name() {
+    // The login's master password: pinentry's answer is held, then injected
+    // into the FIFO writer (here, a file) and `bw login` as BW_PASSWORD. The
+    // panel sees neither the answer nor the written value, and once the
+    // attempt forgets the name nothing is injected.
+    let mut helper = Helper::start();
+    let kept = helper.exec(
+        1,
+        "printf '%s\\n' 'hunter%252'",
+        json!({ "capture": "pinentry:login" }),
+    );
+    assert_eq!(
+        (kept["out"].as_str(), kept["held"].as_bool()),
+        (Some(""), Some(true))
+    );
+    let fifo = helper.dir.join("login-password");
+    let write = format!("printf '%s' \"$BW_PASSWORD\" > '{}'", fifo.display());
+    let written = helper.exec(
+        2,
+        &write,
+        json!({ "inject": { "BW_PASSWORD": "secret:login" } }),
+    );
+    assert_eq!(
+        (written["code"].as_i64(), written["out"].as_str()),
+        (Some(0), Some(""))
+    );
+    assert_eq!(std::fs::read_to_string(&fifo).unwrap(), "hunter%2");
+    // The same name serves a second run of the attempt (a two-step retry),
+    // and a run that keeps a session from it hands the panel no password.
+    let login = helper.exec(
+        3,
+        &format!("test \"$BW_PASSWORD\" = 'hunter%2' && printf '%s\\n' '{TOKEN}'"),
+        json!({ "inject": { "BW_PASSWORD": "secret:login" }, "capture": "session" }),
+    );
+    assert_eq!(login["code"], 0);
+    assert_eq!(login["session"], true);
+    assert!(!login["out"].as_str().unwrap().contains("hunter"));
+    helper.send(json!({ "type": "forgetSecret", "v": 2, "name": "login" }));
+    let gone = helper.exec(
+        4,
+        &write,
+        json!({ "inject": { "BW_PASSWORD": "secret:login" } }),
+    );
+    assert_eq!(gone["code"], 0);
+    assert_eq!(std::fs::read_to_string(&fifo).unwrap(), "");
 }
 
 #[test]
@@ -397,10 +476,10 @@ fn one_secret_is_served_or_copied_by_name() {
 fn runs_can_be_killed_and_stdin_is_delivered() {
     let mut helper = Helper::start();
     helper.send(
-        json!({ "type": "exec", "v": 1, "id": 7, "argv": ["sh", "-c", "sleep 30; echo late"] }),
+        json!({ "type": "exec", "v": 2, "id": 7, "argv": ["sh", "-c", "sleep 30; echo late"] }),
     );
     std::thread::sleep(Duration::from_millis(200));
-    helper.send(json!({ "type": "kill", "v": 1, "id": 7 }));
+    helper.send(json!({ "type": "kill", "v": 2, "id": 7 }));
     let killed = helper.reply("id", 7);
     assert_eq!(
         (killed["code"].as_i64(), killed["out"].as_str()),
@@ -410,10 +489,10 @@ fn runs_can_be_killed_and_stdin_is_delivered() {
 
     // A run that ignores SIGTERM is killed after the grace period.
     helper.send(
-        json!({ "type": "exec", "v": 1, "id": 10, "argv": ["sh", "-c", "trap '' TERM; sleep 30"] }),
+        json!({ "type": "exec", "v": 2, "id": 10, "argv": ["sh", "-c", "trap '' TERM; sleep 30"] }),
     );
     std::thread::sleep(Duration::from_millis(200));
-    helper.send(json!({ "type": "kill", "v": 1, "id": 10 }));
+    helper.send(json!({ "type": "kill", "v": 2, "id": 10 }));
     assert_eq!(helper.reply("id", 10)["code"], 137);
 
     let echoed = helper.exec(8, "cat", json!({ "stdin": "payload" }));
@@ -425,13 +504,13 @@ fn runs_can_be_killed_and_stdin_is_delivered() {
 #[test]
 fn a_reused_run_id_is_refused_and_the_first_run_stays_killable() {
     let mut helper = Helper::start();
-    helper.send(json!({ "type": "exec", "v": 1, "id": 21, "argv": ["sh", "-c", "sleep 30"] }));
+    helper.send(json!({ "type": "exec", "v": 2, "id": 21, "argv": ["sh", "-c", "sleep 30"] }));
     std::thread::sleep(Duration::from_millis(200));
     let again = helper.exec(21, "echo second", json!({}));
     assert_eq!(again["code"], 126);
     assert_eq!(again["err"], "run id in use");
     // The first run still has its kill handle and its entry.
-    helper.send(json!({ "type": "kill", "v": 1, "id": 21 }));
+    helper.send(json!({ "type": "kill", "v": 2, "id": 21 }));
     assert_eq!(helper.reply("id", 21)["code"], 143);
 }
 
@@ -443,7 +522,7 @@ fn runs_do_not_outlive_a_crashed_helper() {
         "trap 'echo stopped > {}; exit 0' TERM; while :; do sleep 0.05; done",
         mark.display()
     );
-    helper.send(json!({ "type": "exec", "v": 1, "id": 1, "argv": ["sh", "-c", script] }));
+    helper.send(json!({ "type": "exec", "v": 2, "id": 1, "argv": ["sh", "-c", script] }));
     std::thread::sleep(Duration::from_millis(300));
     // SIGKILL: no cleanup code of the helper's runs.
     helper.child.kill().unwrap();
@@ -451,5 +530,72 @@ fn runs_do_not_outlive_a_crashed_helper() {
     while !mark.exists() {
         assert!(Instant::now() < deadline, "the run outlived the helper");
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_forget_ends_the_copies_still_serving_the_clipboard() {
+    let mut helper = Helper::start();
+    // A wl-copy that keeps serving, as the real one does under `timeout`
+    // until its clear: it records its pid and whether it was told to stop.
+    // Bounded, so a failure here cannot leave it behind.
+    let dir = helper.dir.clone();
+    std::fs::write(
+        dir.join("wl-copy"),
+        format!(
+            "#!/bin/sh\ncat > {d}/clipboard\necho \"$*\" > {d}/clipboard-args\necho $$ > {d}/clipboard-pid\n\
+             trap 'echo ended > {d}/ended; exit 0' TERM\n\
+             n=0; while [ $n -lt 200 ]; do sleep 0.05; n=$((n+1)); done\n",
+            d = dir.display()
+        ),
+    )
+    .unwrap();
+    let script = format!("cat <<'EOF'\n{}\nEOF", vault_read());
+    helper.exec(1, &script, json!({ "capture": "vault" }));
+    for (q, clear) in [(10, 30), (11, 0)] {
+        let copy = helper.query(
+            q,
+            json!({ "type": "copyPassword", "id": "a", "clearSec": clear }),
+        );
+        assert_eq!(copy["ok"], true);
+        let pid_file = dir.join("clipboard-pid");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pid_file.exists() {
+            assert!(Instant::now() < deadline, "the copy never started");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let args = std::fs::read_to_string(dir.join("clipboard-args")).unwrap_or_default();
+        // The no-expiry form is still a foreground child, so it can be ended.
+        assert_eq!(args.trim(), "--foreground --sensitive", "clearSec {clear}");
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "the copy should still be serving before the forget"
+        );
+
+        helper.send(json!({ "type": "forget", "v": 2 }));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !dir.join("ended").exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the copy outlived the forget (clearSec {clear})"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // A copy after the forget has nothing to copy.
+        let after = helper.query(
+            q + 50,
+            json!({ "type": "copyPassword", "id": "a", "clearSec": clear }),
+        );
+        assert_eq!(after["ok"], false);
+        for name in ["clipboard-pid", "ended", "clipboard"] {
+            let _ = std::fs::remove_file(dir.join(name));
+        }
+        helper.exec(q + 60, &script, json!({ "capture": "vault" }));
     }
 }

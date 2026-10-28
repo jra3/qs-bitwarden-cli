@@ -3170,6 +3170,8 @@ Panel {
 
               Row {
                 width: parent.width
+                // Clear of the code field above, as the device-code row is.
+                topPadding: Style.space(3)
                 spacing: Style.space(6)
 
                 Button {

@@ -18,8 +18,9 @@ const { check, done } = createSuite("session-boot")
 // call, and can be told to refuse the session collection the way a secret
 // service without one would (STUB_NO_SESSION_COLLECTION), to accept the
 // write but file it in the login collection (STUB_MISPLACE), or to fail
-// every search (STUB_SEARCH_DOWN). `search` prints what the real one does:
-// the item's bus path, then its label and the secret.
+// every search (STUB_SEARCH_DOWN). Like secret-tool 0.21.8, `store` takes
+// a collection only by bus path (or `default`); `busctl` answers SearchItems
+// with the item's path, as the secret service does.
 const stub = fs.mkdtempSync(path.join(os.tmpdir(), "qsbw-keyring-"))
 fs.writeFileSync(path.join(stub, "secret-tool"), `#!/usr/bin/env bash
 set -uo pipefail
@@ -29,23 +30,26 @@ collection=""
 for a in "$@"; do case "$a" in --collection=*) collection="\${a#--collection=}" ;; esac; done
 case "$cmd" in
   store)
-    if [ "\${STUB_NO_SESSION_COLLECTION:-}" = "1" ] && [ "$collection" = "session" ]; then
+    case "$collection" in ""|default|/*) ;; *) cat >/dev/null; echo "secret-tool: collection must be a full path, or the 'default' alias" >&2; exit 2 ;; esac
+    if [ "\${STUB_NO_SESSION_COLLECTION:-}" = "1" ] && [ "$collection" = "/org/freedesktop/secrets/collection/session" ]; then
       cat >/dev/null; exit 1
     fi
-    [ "\${STUB_MISPLACE:-}" = "1" ] && collection="login"
+    [ "\${STUB_MISPLACE:-}" = "1" ] && collection="/org/freedesktop/secrets/collection/login"
     cat > "$STUB/value"; printf '%s' "$collection" > "$STUB/collection"; exit 0 ;;
   lookup) [ -s "$STUB/value" ] || exit 1; cat "$STUB/value"; exit 0 ;;
-  search)
-    [ "\${STUB_SEARCH_DOWN:-}" = "1" ] && exit 1
-    [ -s "$STUB/value" ] || exit 0
-    c=$(cat "$STUB/collection"); [ -n "$c" ] || c="login"
-    printf '[/org/freedesktop/secrets/collection/%s/7]\\nlabel = Bitwarden Vault Session\\nsecret = %s\\n' "$c" "$(cat "$STUB/value")"
-    exit 0 ;;
   clear)  rm -f "$STUB/value"; exit 0 ;;
 esac
 exit 1
 `)
 fs.chmodSync(path.join(stub, "secret-tool"), 0o755)
+fs.writeFileSync(path.join(stub, "busctl"), `#!/usr/bin/env bash
+echo "busctl $*" >> "$STUB/calls"
+[ "\${STUB_SEARCH_DOWN:-}" = "1" ] && exit 1
+[ -s "$STUB/value" ] || { echo 'aoao 0 0'; exit 0; }
+c=$(cat "$STUB/collection"); [ -n "$c" ] || c="/org/freedesktop/secrets/collection/login"
+echo "aoao 1 \\"$c/7\\" 0"
+`)
+fs.chmodSync(path.join(stub, "busctl"), 0o755)
 
 const TOKEN = "not-a-real-session-token"
 const bootId = fs.readFileSync(Model.BOOT_ID_PATH, "utf8").trim()
@@ -74,10 +78,10 @@ const secretEnv = { [Model.keyringSecretEnvVar()]: TOKEN }
 reset()
 const storedOk = runStatus(Model.keyringStoreCommand(), secretEnv)
 check("the session is stored in the memory-only session collection",
-  storedOk.status === 0 && fs.readFileSync(path.join(stub, "collection"), "utf8") === "session",
+  storedOk.status === 0 && fs.readFileSync(path.join(stub, "collection"), "utf8") === "/org/freedesktop/secrets/collection/session",
   storedOk.status + " " + fs.readFileSync(path.join(stub, "collection"), "utf8"))
 check("the store is checked by searching for the item afterwards",
-  /^search --all /m.test(calls()), calls())
+  /^busctl --user call .* SearchItems /m.test(calls()), calls())
 check("the stored blob carries the boot id that minted the session",
   stored() === `${bootId} ${TOKEN}`, JSON.stringify(stored()))
 check("the token still never reaches a command line",
@@ -96,7 +100,7 @@ check("a service without a session collection does not get the session at all",
   refused.status === Model.keyringStoreUnavailableCode() && stored() === null,
   refused.status + " " + JSON.stringify(stored()))
 check("and the default collection is never tried",
-  calls().split("\n").filter(l => l.startsWith("store ")).every(l => l.includes("--collection=session"))
+  calls().split("\n").filter(l => l.startsWith("store ")).every(l => l.includes("--collection=/org/freedesktop/secrets/collection/session"))
     && calls().split("\n").filter(l => l.startsWith("store ")).length === 1,
   calls())
 check("the store script names no other collection",

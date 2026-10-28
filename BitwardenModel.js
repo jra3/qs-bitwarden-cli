@@ -1706,11 +1706,13 @@ function deleteItemCommand(itemId, typeCode) {
 // alone; `bw` accepts the key until `bw lock`) protects nothing. Now the
 // store fails instead, and the panel says the session was not remembered.
 // A lookup failure still reads as "no token".
-const KEYRING_SESSION_COLLECTION = "session"
-// Where the session collection's items live on the bus. `secret-tool store
-// --collection=session` is asked for, but what libsecret did is checked here:
-// an item anywhere else is removed again.
-const KEYRING_SESSION_ITEM_PREFIX = "/org/freedesktop/secrets/collection/session/"
+// By its bus path: secret-tool 0.21.8 takes a path or the `default` alias
+// only, and refuses `--collection=session` as a usage error.
+const KEYRING_SESSION_COLLECTION = "/org/freedesktop/secrets/collection/session"
+// Where the session collection's items live on the bus. The store asks for
+// that collection, but what libsecret did is checked here: an item anywhere
+// else is removed again.
+const KEYRING_SESSION_ITEM_PREFIX = KEYRING_SESSION_COLLECTION + "/"
 const BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
 
 // keyringStoreCommand()'s exit codes past 0 and secret-tool's own 1.
@@ -1727,13 +1729,15 @@ function keyringStoreUnavailableCode() { return KEYRING_STORE_UNAVAILABLE }
 function keyringStoreMisplacedCode() { return KEYRING_STORE_MISPLACED }
 function keyringStoreUnverifiedCode() { return KEYRING_STORE_UNVERIFIED }
 
-// Lists where the entry's items are: one item path per line, from
-// `secret-tool search`, whose other lines (the secret among them) are
-// dropped before anything is captured. Fails if the search did.
+// Lists where the entry's items are: one item path per line, from the
+// secret service's SearchItems, which answers with paths only (no secret).
+// `secret-tool search` cannot be used: 0.21.8 prints an item as `[/7]`,
+// without its collection. Fails if the search did.
 function keyringItemPathsScript(account, resultVar) {
-  var attrs = keyringAttributes(account)
-  return resultVar + "=$(secret-tool search --all" + attrs
-    + " 2>/dev/null | grep '^\\[/' | head -c 65536; "
+  return resultVar + "=$(busctl --user call org.freedesktop.secrets /org/freedesktop/secrets"
+    + " org.freedesktop.Secret.Service SearchItems 'a{ss}' 2 service " + shellQuote(KEYRING_SERVICE)
+    + " account " + shellQuote(account)
+    + " 2>/dev/null | head -c 65536 | grep -o '\"/[^\"]*\"' | tr -d '\"'; "
     + "__keyring_pipe=(\"${PIPESTATUS[@]}\"); "
     + "printf '\\n:%s' \"${__keyring_pipe[0]}\"); "
 }
@@ -1755,7 +1759,7 @@ function keyringStoreCommand(slot) {
     + "if [ \"$__keyring_search_rc\" -ne 0 ] || [ -z \"$__keyring_paths\" ]; then __keyring_rc="
     + KEYRING_STORE_UNVERIFIED + "; "
     // Every item must be in the session collection, not only one of them.
-    + "elif printf '%s\\n' \"$__keyring_paths\" | grep -qv '^\\[" + KEYRING_SESSION_ITEM_PREFIX
+    + "elif printf '%s\\n' \"$__keyring_paths\" | grep -qv '^" + KEYRING_SESSION_ITEM_PREFIX
     + "'; then __keyring_rc=" + KEYRING_STORE_MISPLACED + "; fi; "
     + "if [ \"$__keyring_rc\" -ne 0 ]; then secret-tool clear" + attrs + " >/dev/null 2>&1; fi; "
     + "exit \"$__keyring_rc\""

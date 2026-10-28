@@ -164,6 +164,10 @@ case "$cmd" in
   search) [ -f "$f" ] && printf '[/org/freedesktop/secrets/collection/session/1]\nlabel = stub\nsecret = %s\n' "$(cat "$f")"; exit 0 ;;
   *) exit 2 ;;
 esac`)
+  // SearchItems, as the secret service answers it: the item's path only.
+  write("busctl", `
+account=""; while [ $# -gt 0 ]; do case "$1" in account) account="$2"; shift 2;; *) shift;; esac; done
+if [ -f "$STORE_DIR/$account" ]; then echo 'aoao 1 "/org/freedesktop/secrets/collection/session/1" 0'; else echo 'aoao 0 0'; fi`)
   write("systemd-creds", `
 mode=""; name=""
 for a in "$@"; do case "$a" in encrypt|decrypt) mode="$a";; --name=*) name="\${a#--name=}";; esac; done
